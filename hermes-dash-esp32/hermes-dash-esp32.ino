@@ -84,8 +84,67 @@ LGFX tft;
 #define SCREEN_H  172
 #define CENTER_X  160
 #define CENTER_Y  86
-#define ROUND_R   80   // usable radius inside round glass
-#define APERTURE_R 76  // ROUND_R - 4 safety margin (A11)
+#define ROUND_R   80   // usable radius inside round glass (layout hard limit)
+
+// ── LAYOUT CONSTANTS ──────────────────────────────────────
+// All display coordinates in one place. tools/check_layout.py reads these.
+// If you move anything, update the constant — the checker will catch drift.
+#define LAYOUT_CENTER_X       160
+#define LAYOUT_CENTER_Y       86
+
+// STATUS page
+#define STATUS_RING_R         50
+#define STATUS_RING_DOT_R     4
+#define STATUS_OVERFLOW_DX    58     // CENTER_X + this = overflow x
+#define STATUS_OVERFLOW_DY    25     // CENTER_Y - this = overflow y
+#define STATUS_NUM_Y          72
+#define STATUS_NUM_W          48     // DejaVu40 2-digit
+#define STATUS_SESS_Y         100
+#define STATUS_STATE_Y        118
+#define STATUS_DISK_BAR_W     112
+#define STATUS_DISK_BAR_H     6
+#define STATUS_DISK_BAR_DY    34     // CENTER_Y + this
+#define STATUS_DISK_LBL_DY    10     // disk_bar_y + this
+#define STATUS_FOOTER_DY      52     // CENTER_Y + this
+#define STATUS_DOT_DX         50     // CENTER_X + this (fixed, not text-relative)
+#define STATUS_DOT_R          3
+
+// TOKENS page
+#define TK_HEAD_Y             24     // Font0 (was Font2@18 — exceeded R=80)
+#define TK_QUAL_Y             34     // Font0
+#define TK_BIG_Y              62     // DejaVu40 (moved to fit R=80)
+#define TK_BIG_W              150    // 6 chars DejaVu40 worst case
+#define TK_DET1_Y             84     // Font0 for 24H IN/OUT (was Font2 — too wide for R=80)
+#define TK_DET2_Y             108    // Font0 (was 110)
+#define TK_DET3_Y             126    // Font0 (was 130 — exceeded R=80)
+
+// HEALTH page
+#define HL_HEAD_Y             26
+#define HL_ROW0_Y             48
+#define HL_ROW1_Y             70
+#define HL_ROW2_Y             92
+#define HL_ROW3_Y             114
+#define HL_DOT_DX             56     // CENTER_X - this
+#define HL_DOT_R              3
+#define HL_ERR_DX             55     // CENTER_X + this
+#define HL_ERR_Y              92
+#define HL_AUTH_Y             134    // was 136 (moved up for host line)
+#define HL_HOST_Y             140    // was 150 — exceeded R=80 (moved up)
+
+// Worst-case string widths (for checker; font_w * char_count)
+// Font0 = 5px/char, Font2 = 8px/char, DejaVu40 ≈ 25px/char
+#define WC_FOOTER_W           85     // "v0.21.3  99 bots" 17ch F0
+#define WC_DISK_W             40     // "DISK 99%" 8ch F0
+#define WC_HEAD_W             50     // "TOKENS 24H" 10ch F0
+#define WC_QUAL_W             85     // "NEW SESSIONS ONLY" 17ch F0
+#define WC_IO24_W             128    // "IN 1234M  OUT 1234M" 16ch F2
+#define WC_IO7_W              105    // "IN 1234M  OUT 1234M?" 21ch F0
+#define WC_CACHE_W            65     // "CACHE --  $--" 13ch F0
+#define WC_CALLS_W            110    // "CALLS 1234M  SES 12345" 22ch F0
+#define WC_COST_W             48     // "$99.99" 6ch F2
+#define WC_AUTH_W             96     // "AUTH EXPIRED" 12ch F2
+#define WC_HOST_W             90     // "CPU 100%  RAM 100%" 18ch F0
+#define WC_OVERFLOW_W         15     // "+99" 3ch F0
 
 // ── Colors (RGB565) ───────────────────────────────────
 #define C_BG        0x0000  // black
@@ -391,15 +450,14 @@ bool fetch_dashboard() {
 // Handles total 0, 1, ≤8, and >8 (overflow marker).
 void draw_platform_ring() {
     int n = g_platforms_rendered;
-    if (n == 0 && g_platforms_total == 0) return;  // no platforms → nothing
+    if (n == 0 && g_platforms_total == 0) return;
 
     bool blink_on = (millis() / 400) % 2 == 0;
-    int ring_r = ROUND_R - 30;  // 50 — inset for aperture
+    int ring_r = STATUS_RING_R;
     float start_angle = 150.0f;
     float end_angle   = 30.0f;
 
     if (n == 1) {
-        // Single dot at arc midpoint (top center)
         float rad = 90.0f * PI / 180.0f;
         int x = CENTER_X + (int)(ring_r * cos(rad));
         int y = CENTER_Y - (int)(ring_r * sin(rad));
@@ -407,7 +465,7 @@ void draw_platform_ring() {
         if (g_platforms[0].needs_attention) color = blink_on ? C_YELLOW : C_BG;
         else if (g_platforms[0].connected)  color = C_OK;
         else                                 color = C_DOWN;
-        tft.fillCircle(x, y, 4, color);
+        tft.fillCircle(x, y, STATUS_RING_DOT_R, color);
         return;
     }
 
@@ -419,21 +477,19 @@ void draw_platform_ring() {
         int x = CENTER_X + (int)(ring_r * cos(rad));
         int y = CENTER_Y - (int)(ring_r * sin(rad));
 
-        // A10 fix: colour from THIS platform's state (not i < platforms_up)
         uint16_t color;
         if (g_platforms[i].needs_attention) color = blink_on ? C_YELLOW : C_BG;
         else if (g_platforms[i].connected)   color = C_OK;
         else                                  color = C_DOWN;
-        tft.fillCircle(x, y, 4, color);
+        tft.fillCircle(x, y, STATUS_RING_DOT_R, color);
     }
 
-    // Overflow marker when total exceeds MAX_PLATFORMS
     if (g_platforms_total > MAX_PLATFORMS) {
         int overflow = g_platforms_total - MAX_PLATFORMS;
         tft.setFont(&fonts::Font0);
         tft.setTextColor(C_YELLOW, C_BG);
         tft.setTextDatum(MC_DATUM);
-        tft.drawString("+" + String(overflow), CENTER_X + ring_r + 8, CENTER_Y - ring_r / 2);
+        tft.drawString("+" + String(overflow), CENTER_X + STATUS_OVERFLOW_DX, CENTER_Y - STATUS_OVERFLOW_DY);
     }
 }
 
@@ -442,9 +498,9 @@ void draw_center(int sessions) {
     tft.setTextColor(C_TEXT, C_BG);
     tft.setTextDatum(MC_DATUM);
     tft.setFont(&fonts::DejaVu40);
-    tft.drawNumber(sessions, CENTER_X, CENTER_Y - 14);
+    tft.drawNumber(sessions, CENTER_X, STATUS_NUM_Y);
     tft.setFont(&fonts::Font2);
-    tft.drawString(sessions == 1 ? "SESSION" : "SESSIONS", CENTER_X, CENTER_Y + 14);
+    tft.drawString(sessions == 1 ? "SESSION" : "SESSIONS", CENTER_X, STATUS_SESS_Y);
 }
 
 // ── Render: gateway state line ────────────────────────
@@ -453,22 +509,22 @@ void draw_state(bool busy, bool degraded) {
     tft.setTextDatum(MC_DATUM);
     if (degraded) {
         tft.setTextColor(C_DEGRADED, C_BG);
-        tft.drawString("DEGRADED", CENTER_X, CENTER_Y + 32);
+        tft.drawString("DEGRADED", CENTER_X, STATUS_STATE_Y);
     } else if (busy) {
         tft.setTextColor(C_YELLOW, C_BG);
-        tft.drawString("BUSY", CENTER_X, CENTER_Y + 32);
+        tft.drawString("BUSY", CENTER_X, STATUS_STATE_Y);
     } else {
         tft.setTextColor(C_OK, C_BG);
-        tft.drawString("RUNNING", CENTER_X, CENTER_Y + 32);
+        tft.drawString("RUNNING", CENTER_X, STATUS_STATE_Y);
     }
 }
 
 // ── Render: disk bar (A11: moved up inside aperture) ──
 void draw_disk_bar(int pct) {
-    int bar_w = 112;   // A11: narrower to fit aperture
-    int bar_h = 6;
-    int bar_x = CENTER_X - bar_w / 2;  // 104
-    int bar_y = CENTER_Y + 34;          // 120
+    int bar_w = STATUS_DISK_BAR_W;
+    int bar_h = STATUS_DISK_BAR_H;
+    int bar_x = CENTER_X - bar_w / 2;
+    int bar_y = CENTER_Y + STATUS_DISK_BAR_DY;
 
     tft.drawRect(bar_x, bar_y, bar_w, bar_h, C_DIM);
     uint16_t bar_color = (pct > 85) ? C_DOWN : (pct > 70) ? C_DEGRADED : C_OK;
@@ -478,7 +534,7 @@ void draw_disk_bar(int pct) {
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("DISK " + String(pct) + "%", CENTER_X, bar_y + 10);  // y=130
+    tft.drawString("DISK " + String(pct) + "%", CENTER_X, bar_y + STATUS_DISK_LBL_DY);
 }
 
 // ── Render: footer (A11: moved up, dot at fixed inset) ─
@@ -486,14 +542,12 @@ void draw_footer(const String& ver, const String& pro) {
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
     tft.setTextDatum(MC_DATUM);
-    int footer_y = CENTER_Y + 52;  // 138
+    int footer_y = CENTER_Y + STATUS_FOOTER_DY;
     String footer = "v" + ver + "  " + pro + " bots";
     tft.drawString(footer, CENTER_X, footer_y);
 
-    // A11 fix: dot at FIXED position (not after text end).
-    // Its radius from center is independent of version string length.
     if (can_update) {
-        tft.fillCircle(CENTER_X + 50, footer_y, 3, C_YELLOW);  // (210, 138)
+        tft.fillCircle(CENTER_X + STATUS_DOT_DX, footer_y, STATUS_DOT_R, C_YELLOW);
     }
 }
 
@@ -506,14 +560,13 @@ void draw_tokens_page(bool is7d) {
     // A7: read from THIS period's struct only
     const PeriodUsage& u = is7d ? usage_7d : usage_24h;
 
-    // Heading
+    // Heading — Font0 at TK_HEAD_Y (was Font2@18 — exceeded R=80)
     tft.setTextColor(C_DIM, C_BG);
-    tft.setFont(&fonts::Font2);
-    tft.drawString(is7d ? "TOKENS 7D" : "TOKENS 24H", CENTER_X, 18);
+    tft.setFont(&fonts::Font0);
+    tft.drawString(is7d ? "TOKENS 7D" : "TOKENS 24H", CENTER_X, TK_HEAD_Y);
 
     // A8: honest qualifier — cohort totals, not rolling windows
-    tft.setFont(&fonts::Font0);
-    tft.drawString("NEW SESSIONS ONLY", CENTER_X, 32);
+    tft.drawString("NEW SESSIONS ONLY", CENTER_X, TK_QUAL_Y);
 
     // Big total (A6: "--" for absent, "0" for real zero)
     tft.setTextColor(C_TEXT, C_BG);
@@ -526,7 +579,7 @@ void draw_tokens_page(bool is7d) {
     } else {
         total_str = fmt_tokens(u.total);
     }
-    tft.drawString(total_str, CENTER_X, 58);
+    tft.drawString(total_str, CENTER_X, TK_BIG_Y);
 
     if (is7d) {
         // Cost headline
@@ -534,7 +587,7 @@ void draw_tokens_page(bool is7d) {
         tft.setFont(&fonts::Font2);
         String cost_s = u.valid ? ("$" + String(u.cost, 2)) : "--";
         if (u.valid && is_stale()) cost_s += "?";
-        tft.drawString(cost_s, CENTER_X, 88);
+        tft.drawString(cost_s, CENTER_X, TK_DET1_Y);
 
         // Calls / sessions
         tft.setTextColor(C_DIM, C_BG);
@@ -542,37 +595,39 @@ void draw_tokens_page(bool is7d) {
         String cs = u.valid
             ? ("CALLS " + fmt_tokens(u.calls) + "  SES " + String(u.sessions))
             : "CALLS --  SES --";
-        tft.drawString(cs, CENTER_X, 112);
+        tft.drawString(cs, CENTER_X, TK_DET2_Y);
 
         // In/Out split — A7 fix: reads usage_7d.input/output (was reading 24h)
+        // Font0 at TK_DET3_Y (was Font0@136 — exceeded R=80)
         String io = u.valid
             ? ("IN " + fmt_tokens(u.input) + "  OUT " + fmt_tokens(u.output))
             : "IN --  OUT --";
         if (u.valid && is_stale()) io += "?";
-        tft.drawString(io, CENTER_X, 136);
+        tft.drawString(io, CENTER_X, TK_DET3_Y);
     } else {
-        // In/Out split
+        // In/Out split — Font0 at TK_DET1_Y. Font2 here is 160px wide and cannot
+        // fit inside R=80 at any y (checked by tools/check_layout.py).
         tft.setTextColor(C_TEXT, C_BG);
-        tft.setFont(&fonts::Font2);
+        tft.setFont(&fonts::Font0);
         String io = u.valid
             ? ("IN " + fmt_tokens(u.input) + "  OUT " + fmt_tokens(u.output))
             : "IN --  OUT --";
         if (u.valid && is_stale()) io += "?";
-        tft.drawString(io, CENTER_X, 88);
+        tft.drawString(io, CENTER_X, TK_DET1_Y);
 
-        // Cache + cost
+        // Cache + cost — Font0 at TK_DET2_Y
         tft.setTextColor(C_DIM, C_BG);
         tft.setFont(&fonts::Font0);
         String cc = u.valid
             ? ("CACHE " + fmt_tokens(u.cache) + "  $" + String(u.cost, 2))
             : "CACHE --  $--";
-        tft.drawString(cc, CENTER_X, 112);
+        tft.drawString(cc, CENTER_X, TK_DET2_Y);
 
-        // Calls / sessions
+        // Calls / sessions — Font0 at TK_DET3_Y
         String cs = u.valid
             ? ("CALLS " + fmt_tokens(u.calls) + "  SES " + String(u.sessions))
             : "CALLS --  SES --";
-        tft.drawString(cs, CENTER_X, 136);
+        tft.drawString(cs, CENTER_X, TK_DET3_Y);
     }
 }
 
@@ -584,10 +639,10 @@ void draw_health_page() {
     // Heading
     tft.setTextColor(C_DIM, C_BG);
     tft.setFont(&fonts::Font2);
-    tft.drawString("HEALTH", CENTER_X, 26);
+    tft.drawString("HEALTH", CENTER_X, HL_HEAD_Y);
 
     // Component rows — tri-state: OK (green) / DOWN (red) / UNKNOWN (grey)
-    const int rows_y[4]     = {48, 70, 92, 114};
+    const int rows_y[4]     = {HL_ROW0_Y, HL_ROW1_Y, HL_ROW2_Y, HL_ROW3_Y};
     const char* rows_txt[4] = {"GATEWAY", "STORAGE", "DASHBOARD", "PLATFORMS"};
     CompState rows_state[4] = {comp_gw, comp_storage, comp_dash, comp_platforms};
 
@@ -601,14 +656,14 @@ void draw_health_page() {
             case COMP_DOWN:    dot_color = C_DOWN;    break;
             default:           dot_color = C_DIM;     break;  // UNKNOWN → grey
         }
-        tft.fillCircle(CENTER_X - 56, rows_y[i], 3, dot_color);
+        tft.fillCircle(CENTER_X - HL_DOT_DX, rows_y[i], HL_DOT_R, dot_color);
     }
 
     // Dashboard error count (orange suffix, only when > 0)
     if (dash_errors > 0) {
         tft.setFont(&fonts::Font0);
         tft.setTextColor(C_DEGRADED, C_BG);
-        tft.drawString(String(dash_errors) + "E", CENTER_X + 55, 92);
+        tft.drawString(String(dash_errors) + "E", CENTER_X + HL_ERR_DX, HL_ERR_Y);
     }
 
     // Auth state — tri-state (UNKNOWN / EXPIRED / OK)
@@ -621,19 +676,22 @@ void draw_health_page() {
         default:           auth_txt = "AUTH ?";        auth_color = C_DIM;  break;
     }
     tft.setTextColor(auth_color, C_BG);
-    tft.drawString(auth_txt, CENTER_X, 136);
+    tft.drawString(auth_txt, CENTER_X, HL_AUTH_Y);
 
     // Host CPU/RAM — A6: "--" when absent (not silently carried over)
+    // Font0 at HL_HOST_Y (was y=150 — exceeded R=80)
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
     String host_str;
     if (!g_host_known) {
-        host_str = "CPU --  RAM --";
+        host_str = "CPU -- RAM --";
     } else {
-        host_str = "CPU " + String(host_cpu) + "%  RAM " + String(host_ram) + "%";
+        // single space between the metrics: with the stale "?" suffix the
+        // 19-char form measured r=81.3 > R=80 (tools/check_layout.py)
+        host_str = "CPU " + String(host_cpu) + "% RAM " + String(host_ram) + "%";
         if (is_stale()) host_str += "?";
     }
-    tft.drawString(host_str, CENTER_X, 150);
+    tft.drawString(host_str, CENTER_X, HL_HOST_Y);
 }
 
 // ── Render: full screen (rotates 4 pages) ─────────────
