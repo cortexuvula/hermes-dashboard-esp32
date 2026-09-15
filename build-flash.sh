@@ -55,10 +55,12 @@ while (( $# )); do
       ;;
     --build-only) BUILD_ONLY_SEEN=1 ;;
     --flash)      WANT_FLASH=1 ;;
-    --remote-host) shift; [[ $# -ge 1 && "$1" != -* ]] || { echo "FAIL: --remote-host needs a value" >&2; usage; exit 2; }; REMOTE_HOST="$1" ;;
-    --remote-user) shift; [[ $# -ge 1 && "$1" != -* ]] || { echo "FAIL: --remote-user needs a value" >&2; usage; exit 2; }; REMOTE_USER="$1" ;;
-    --remote-dev)  shift; [[ $# -ge 1 && "$1" != -* ]] || { echo "FAIL: --remote-dev needs a value" >&2; usage; exit 2; }; REMOTE_DEV="$1" ;;
-    --local-port)  shift; [[ $# -ge 1 && "$1" != -* ]] || { echo "FAIL: --local-port needs a value" >&2; usage; exit 2; }; LOCAL_PORT="$1" ;;
+    # N2: values must be present AND non-empty (an empty value would slip
+    # through a bare != -* check and fail later as a confusing ssh error)
+    --remote-host) shift; [[ $# -ge 1 && -n "$1" && "$1" != -* ]] || { echo "FAIL: --remote-host needs a non-empty value" >&2; usage; exit 2; }; REMOTE_HOST="$1" ;;
+    --remote-user) shift; [[ $# -ge 1 && -n "$1" && "$1" != -* ]] || { echo "FAIL: --remote-user needs a non-empty value" >&2; usage; exit 2; }; REMOTE_USER="$1" ;;
+    --remote-dev)  shift; [[ $# -ge 1 && -n "$1" && "$1" != -* ]] || { echo "FAIL: --remote-dev needs a non-empty value" >&2; usage; exit 2; }; REMOTE_DEV="$1" ;;
+    --local-port)  shift; [[ $# -ge 1 && -n "$1" && "$1" != -* ]] || { echo "FAIL: --local-port needs a non-empty value" >&2; usage; exit 2; }; LOCAL_PORT="$1" ;;
     *)
       echo "FAIL: unknown argument '$1'" >&2
       usage
@@ -140,11 +142,14 @@ if [[ "$UNIT" == home ]]; then
   REMOTE="${REMOTE_USER:+$REMOTE_USER@}$REMOTE_HOST"
   echo "== flashing on $REMOTE:$REMOTE_DEV =="
   REMOTE_TMP="$(ssh "$REMOTE" 'd=$(mktemp -d /tmp/hermes-dash.XXXXXXXX) && chmod 700 "$d" && echo "$d"')"
+  # N1: arm the cleanup trap IMMEDIATELY — if the returned string fails
+  # validation below (or anything else dies mid-transfer) the remote dir
+  # must still be removed on exit.
+  trap cleanup_remote EXIT
   if [[ -z "$REMOTE_TMP" || "$REMOTE_TMP" != /tmp/hermes-dash.* ]]; then
     echo "FAIL: remote did not return a valid temp dir (got: '$REMOTE_TMP')" >&2
     exit 1
   fi
-  trap cleanup_remote EXIT
   scp -q "$BIN" "$REMOTE:$REMOTE_TMP/hermes-dash-$UNIT.bin"
   ssh "$REMOTE" "~/.local/bin/esptool --chip esp32c6 --port $REMOTE_DEV --baud 460800 --before default_reset --after hard_reset write_flash -z 0x0 $REMOTE_TMP/hermes-dash-$UNIT.bin"
   cleanup_remote

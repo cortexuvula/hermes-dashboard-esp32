@@ -23,20 +23,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile-only firmware gate (never publishes binaries)
+      - name: Install arduino-cli (pinned)
+        run: |
+          # N3: pinned version with checksum verification — replaces the
+          # unpinned curl | sh.
+          ARDUINO_CLI_VERSION=1.0.4
+          curl -fsSL -o /tmp/aci.tar.gz \
+            "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz"
+          echo "a28a24721532d9c2f9499c9217ecec4ab94cece249dffdd568b02fe397fef923  /tmp/aci.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/bin" && tar -xzf /tmp/aci.tar.gz -C "$HOME/bin" arduino-cli
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Compile-only firmware gate — BOTH unit variants (never publishes binaries)
         run: |
           if [[ -x tools/ci-compile.sh ]]; then
             tools/ci-compile.sh
           else
-            # Equivalent inline (firmware lane may land tools/ci-compile.sh)
-            curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-            export PATH="$PWD/bin:$PATH"
+            # Equivalent inline (firmware lane may land tools/ci-compile.sh).
+            # N3: compile work AND home so a broken wifi_config.home.h.example
+            # or a broken UNIT_HOME include path cannot stay green.
             arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
             arduino-cli core install esp32:esp32 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-            cd hermes-dash-esp32
-            cp wifi_config.work.h.example wifi_config.work.h   # dummy values only
             arduino-cli lib install LovyanGFX ArduinoJson FastLED
+            cd hermes-dash-esp32
+            for unit in work home; do
+              cp "wifi_config.${unit}.h.example" "wifi_config.${unit}.h"   # dummy values only
+            done
             arduino-cli compile \
               --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app \
-              --output-dir /tmp/dash-build .
+              --output-dir /tmp/dash-build-work .
+            arduino-cli compile \
+              --build-property compiler.cpp.extra_flags=-DUNIT_HOME \
+              --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app \
+              --output-dir /tmp/dash-build-home .
           fi

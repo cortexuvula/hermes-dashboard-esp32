@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """Hermes Dashboard Relay — runs on the relay host (e.g. omarchy-home).
 
-Fetches the Hermes dashboard /api/status upstream (with a hard ≤3 s budget
-and a 128 KB read cap) and re-serves an ALLOWLISTED compact object on
-:9120 for the ESP32 on the LAN. Token-usage totals and host stats come
-from usage-server (:9121) via a background refresher thread — a stalled
-usage upstream can NEVER block or delay a response (audit A5). The
-worst-case response time is bounded by the status timeout alone (<4 s).
+Fetches the Hermes dashboard /api/status upstream (with a hard TOTAL
+budget of STATUS_TIMEOUT seconds enforced against a monotonic deadline —
+not merely a per-socket-operation timeout — plus a 128 KB read cap) and
+re-serves an ALLOWLISTED compact object on :9120 for the ESP32 on the
+LAN. Token-usage totals and host stats come from usage-server (:9121)
+via a background refresher thread — a stalled or trickling usage upstream
+can NEVER block or delay a response (audit A5). Worst-case response time
+is bounded by the status budget: the fetch is aborted at ~STATUS_TIMEOUT
+(3.0 s) + response write, comfortably inside the board's 8 s HTTP wait.
+
+Connection-layer limit (documented limitation, Finding 3): the relay
+spawns a thread + fd per accepted connection BEFORE the concurrency
+semaphore is consulted, and the per-connection timeout is per-operation —
+a client trickling ~1 byte per just-under-CONN_TIMEOUT seconds can hold
+a thread for a long time at trivial cost. For a LAN service polled by a
+single board this is accepted; it is not a general DoS defence.
 
 Contract (schema 2) — see the CONTRACT section in ../README.md:
   - Only the keys the board parses are emitted; nothing passes through.
   - Unavailable usage data is JSON null, never omitted, never zeroed
     (tokens_24h / tokens_7d / host).
-  - usage_age_s  int|null  seconds since the usage snapshot was taken
-    (computed relay-side; the board has no clock).
+  - usage_age_s  int|null  age of the usage DATA: seconds since the
+    producer's generated_at (falling back to the relay's fetch time only
+    when generated_at is absent), clamped >= 0. The board has no clock,
+    and usage-server may serve its last-good payload indefinitely, so
+    this producer-side age is the only staleness signal (Finding 2).
   - generated_at int|null  epoch seconds, forwarded from usage-server.
   - schema       int       contract version (2).
 
@@ -40,7 +53,12 @@ import urllib.request
 UPSTREAM = "http://100.79.10.43:9119/api/status"  # Mac's Tailscale IP
 USAGE_URL = "http://100.79.10.43:9121/"            # usage-server on same host
 LISTEN_PORT = 9120
-STATUS_TIMEOUT = 3.0      # hard budget; worst-case response stays < 4 s (A5)
+# TOTAL budget for the whole upstream status fetch (connect + headers +
+# body), enforced against a monotonic deadline — a trickle of bytes that
+# completes each recv inside the socket timeout still aborts here (A5,
+# Finding 1). Worst-case response ≈ this + response write, inside the
+# board's 8 s HTTP wait.
+STATUS_TIMEOUT = 3.0
 USAGE_TIMEOUT = 2.0       # background refresher only, never on request path
 USAGE_REFRESH = 5.0       # background refresh interval (board polls ~10 s)
 STATUS_CAP = 128 * 1024   # hard byte cap on the upstream status body (A9)
@@ -69,14 +87,49 @@ class UpstreamError(Exception):
 
 
 def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
-    """GET url, enforcing a hard byte cap even when length is unknown or
-    chunked (A9). Raises UpstreamError on transport failure or over-cap."""
+    """GET url with a TOTAL time budget and a hard byte cap.
+
+    `timeout` bounds the WHOLE fetch, not each recv: urllib's timeout is
+    per-socket-operation, so an upstream that trickles bytes (each read
+    completing inside the socket timeout) could otherwise hold the caller
+    arbitrarily long (Finding 1). A monotonic deadline is checked before
+    every read and the socket timeout is re-armed to the REMAINING budget,
+    so no single read can overshoot the deadline by more than epsilon.
+    The byte cap is enforced even when the length is unknown or chunked
+    (A9).
+
+    Raises UpstreamError on transport failure, over-budget or over-cap.
+    """
+    deadline = time.monotonic() + timeout
+
+    def _arm(sock, remaining):
+        # Bound the NEXT blocking operation by the remaining budget only.
+        try:
+            sock.settimeout(max(0.05, remaining))
+        except Exception:
+            pass
+
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # read1 returns as soon as ANY bytes are available; a plain
+            # read(8192) on a length-delimited body blocks until the full
+            # amount arrives, which would ignore the deadline between reads.
+            reader = getattr(resp, "read1", None) or resp.read
+            sock = None
+            try:  # http.client: BufferedReader → SocketIO → socket
+                sock = resp.fp.raw._sock
+            except Exception:
+                pass
             chunks, total = [], 0
             while True:
-                chunk = resp.read(8192)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise UpstreamError(
+                        f"upstream exceeded total budget of {timeout}s: {url}")
+                if sock is not None:
+                    _arm(sock, remaining)
+                chunk = reader(8192)
                 if not chunk:
                     break
                 total += len(chunk)
@@ -132,20 +185,29 @@ class UsageRefresher(threading.Thread):
             return self._snapshot, self._taken_at
 
 
-def build_payload(status: dict, refresher: UsageRefresher) -> dict:
+def build_payload(status: dict, refresher: UsageRefresher, now=None) -> dict:
     """Assemble the schema-2 response: allowlisted status keys + usage."""
     payload = {k: status.get(k) for k in STATUS_ALLOWLIST}  # missing → null
+    now = time.time() if now is None else now
 
     usage, taken_at = refresher.snapshot() if refresher else (None, None)
     ga = usage.get("generated_at") if isinstance(usage, dict) else None
+    ga = ga if isinstance(ga, (int, float)) and not isinstance(ga, bool) else None
     payload["tokens_24h"] = _pick(usage.get("h24"), TOKEN_FIELDS) \
         if isinstance(usage, dict) else None
     payload["tokens_7d"] = _pick(usage.get("d7"), TOKEN_FIELDS) \
         if isinstance(usage, dict) else None
     payload["host"] = _pick(usage.get("host"), HOST_FIELDS) \
         if isinstance(usage, dict) else None
-    payload["usage_age_s"] = int(time.time() - taken_at) if taken_at else None
-    payload["generated_at"] = ga if isinstance(ga, (int, float)) else None
+    # usage_age_s measures the age of the DATA, not of the relay's fetch:
+    # prefer the producer's generated_at — usage-server serves its last-good
+    # payload indefinitely when its collector fails, so a freshly-fetched
+    # snapshot can still be hours old (Finding 2). generated_at of 0/None
+    # means unknown → fall back to the fetch time; clamp at >= 0 so a skewed
+    # future producer timestamp can never emit a negative age.
+    data_time = ga if ga else taken_at
+    payload["usage_age_s"] = max(0, int(now - data_time)) if data_time else None
+    payload["generated_at"] = ga if ga else None
     payload["schema"] = SCHEMA
     return payload
 
@@ -194,7 +256,11 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                                               self.server.cfg.refresher))
             except Exception as e:
                 # Status fetch failed → 502, board renders OFFLINE (A5).
-                self._send(502, {"error": str(e)})
+                # Full detail (incl. the upstream URL) goes to the relay's
+                # log only; LAN clients get a generic reason (N4).
+                print(f"[relay] 502 upstream error for "
+                      f"{self.client_address[0]}: {e}", flush=True)
+                self._send(502, {"error": "upstream status fetch failed"})
         finally:
             self.server.slots.release()
 

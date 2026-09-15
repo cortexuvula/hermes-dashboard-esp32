@@ -38,7 +38,7 @@ dashboard `GET /api/status` (as of Hermes v0.2x).
 | `components` | object\|null | passes through; **null if upstream omits it** (never fabricated) |
 | `tokens_24h`, `tokens_7d` | object\|null | `{total, input, output, cache, reasoning, api_calls, sessions, est_cost}` — **JSON null when usage data is unavailable, never omitted, never zeroed** |
 | `host` | object\|null | `{cpu_percent, load_percent, ram_used_percent, ram_total_mb}` — null when unavailable |
-| `usage_age_s` | int\|null | seconds since the usage snapshot was taken (computed relay-side — the board has no clock); null if unknown |
+| `usage_age_s` | int\|null | **age of the usage DATA**: seconds since the producer's `generated_at` (falling back to the relay's fetch time only when `generated_at` is absent), clamped ≥ 0. The board has no clock, and usage-server may serve its last-good payload indefinitely when its collector fails, so this producer-side age is the board's only staleness signal |
 | `generated_at` | int\|null | epoch seconds, forwarded from the usage snapshot |
 | `schema` | int | contract version — currently `2` |
 
@@ -60,10 +60,25 @@ qualifier for these numbers (firmware ≥ schema 2).
 Upstream read caps: status ≤ 128 KB, usage ≤ 32 KB — oversize upstream
 responses fail predictably (502 / null usage fields).
 
-Relay timing: worst-case response ≤ 4 s. Status fetch budget ≤ 3 s; usage
-is fetched on a background refresher and NEVER blocks a response. If the
-status fetch itself fails the relay answers 502 with `{"error": …}` and the
-board renders OFFLINE.
+Relay timing: the upstream status fetch runs under a hard TOTAL budget
+(3.0 s by default) enforced against a monotonic deadline inside the relay —
+not merely a per-socket-operation timeout — so even an upstream that
+trickles bytes (each recv completing inside the socket timeout) is
+aborted at the budget. Worst-case response ≈ the status budget plus the
+response write (~3.1 s observed), comfortably inside the board's 8 s HTTP
+wait. Usage is fetched by a background refresher and NEVER blocks a
+response. If the status fetch fails the relay answers 502 with a generic
+`{"error": …}` (upstream detail goes to the relay log only) and the board
+renders OFFLINE.
+
+Connection-layer limit (accepted, documented): the relay spawns a thread
+and file descriptor per accepted connection BEFORE the concurrency
+semaphore is consulted, and the per-connection timeout is per-operation —
+a client trickling ~1 byte per just-under-timeout interval can hold a
+thread for a long time at trivial cost (fd/thread exhaustion at scale).
+The concurrency semaphore bounds request *processing*, not connection
+count. For a LAN service polled by a single board this is an accepted
+trade-off; it is not a general DoS defence.
 
 ## Display
 

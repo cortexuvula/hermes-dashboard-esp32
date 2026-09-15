@@ -36,9 +36,24 @@ class SlowHandler(http.server.BaseHTTPRequestHandler):
     usage_body = b"{}"
     usage_code = 200
     chunked = False
+    # status_drip > 0 → send the status body 1 byte at a time with that
+    # delay, Content-Length declared (Finding 1: every individual recv
+    # completes well inside the socket timeout)
+    status_drip = 0.0
 
     def do_GET(self):
         if self.path.startswith("/api/status"):
+            if self.status_drip > 0:
+                time.sleep(self.status_delay)
+                self.send_response(self.status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(self.status_body)))
+                self.end_headers()
+                for i in range(len(self.status_body)):
+                    self.wfile.write(self.status_body[i:i + 1])
+                    self.wfile.flush()
+                    time.sleep(self.status_drip)
+                return
             time.sleep(self.status_delay)
             self._reply(self.status_code, self.status_body)
         else:
@@ -191,12 +206,40 @@ class TestNullSemantics(RelayTestCase):
         self.assertEqual(data["generated_at"], SAMPLE_USAGE["generated_at"])
 
     def test_usage_age_s_int(self):
-        _, data = self.get()
+        fresh = dict(SAMPLE_USAGE)
+        fresh["generated_at"] = int(time.time()) - 2
+        self.handler.usage_body = json.dumps(fresh).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == fresh["generated_at"]:
+                break
+            time.sleep(0.05)
         self.assertIsInstance(data["usage_age_s"], int)
         self.assertLess(data["usage_age_s"], 30)
 
 
 class TestNonBlocking(RelayTestCase):
+    def test_drip_feed_bounded_by_total_budget(self):
+        # Finding 1: an upstream that TRICKLES the body (declared
+        # Content-Length, one byte per drip, each recv completing inside
+        # the socket timeout) must not hold the response past the total
+        # status budget. Old code: per-recv socket timeout only →
+        # unbounded (measured 4.29 s @0.2 s/byte, 10.58 s @0.5 s/byte).
+        self.handler.status_drip = 0.5   # 24-byte body → ~12 s if unbounded
+        t0 = time.monotonic()
+        try:
+            urllib.request.urlopen(self.url, timeout=30)
+            self.fail("expected 502 for over-budget drip upstream")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 502)
+            e.read()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, relay.STATUS_TIMEOUT + 1.0,
+                        f"drip upstream answered after {elapsed:.2f}s, "
+                        f"budget {relay.STATUS_TIMEOUT}s exceeded")
+
     def test_stalled_usage_does_not_block_response(self):
         # usage upstream hangs forever; relay must still answer fast (A5)
         self.cfg.refresher.url = self.usage_url
@@ -269,6 +312,96 @@ class TestCaps(RelayTestCase):
             self.fail("expected 502 for oversize unknown-length body")
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 502)
+
+
+class TestUsageAge(RelayTestCase):
+    """usage_age_s must measure DATA age (producer's generated_at), not
+    the relay's fetch time (Finding 2)."""
+
+    def test_age_reflects_producer_timestamp(self):
+        # usage-server serving its last-good payload (collector dead):
+        # generated_at is 1 hour old but the relay fetched it seconds ago.
+        # The age must report ~3600 s, not ~0 s.
+        stale = dict(SAMPLE_USAGE)
+        stale["generated_at"] = int(time.time()) - 3600
+        self.handler.usage_body = json.dumps(stale).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == stale["generated_at"]:
+                break
+            time.sleep(0.05)
+        self.assertEqual(data["generated_at"], stale["generated_at"])
+        self.assertGreater(data["usage_age_s"], 3500,
+                           f"age {data['usage_age_s']}s looks like fetch "
+                           f"age, not data age")
+        self.assertLess(data["usage_age_s"], 3700)
+
+    def test_age_falls_back_to_fetch_time_without_generated_at(self):
+        # producer omits generated_at → fall back to relay fetch time
+        no_ga = dict(SAMPLE_USAGE)
+        del no_ga["generated_at"]
+        self.handler.usage_body = json.dumps(no_ga).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        _, data = None, None
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] is None:
+                break
+            time.sleep(0.05)
+        self.assertIsNone(data["generated_at"])
+        self.assertIsNotNone(data["usage_age_s"], "fetch-time fallback")
+        self.assertLess(data["usage_age_s"], 60)
+
+    def test_age_never_negative_with_skewed_future_timestamp(self):
+        # producer clock ahead of the relay → age clamped to 0, not negative
+        future = dict(SAMPLE_USAGE)
+        future["generated_at"] = int(time.time()) + 600
+        self.handler.usage_body = json.dumps(future).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == future["generated_at"]:
+                break
+            time.sleep(0.05)
+        self.assertEqual(data["generated_at"], future["generated_at"])
+        self.assertEqual(data["usage_age_s"], 0)
+
+    def test_age_null_when_never_had_data(self):
+        cfg = relay.RelayConfig(self.status_url, "http://127.0.0.1:9/")
+        cfg.refresher.interval = 0.05
+        httpd = relay.make_server("127.0.0.1", 0, cfg)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            time.sleep(0.3)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{httpd.server_port}/api/status",
+                    timeout=10) as r:
+                data = json.loads(r.read())
+            self.assertIsNone(data["usage_age_s"])
+            self.assertIsNone(data["generated_at"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class TestErrorBody(RelayTestCase):
+    def test_502_body_does_not_leak_upstream_url(self):
+        # N4: the upstream exception (which contains the URL) must reach
+        # the relay log only — the client gets a generic reason.
+        self.handler.status_code = 500
+        try:
+            urllib.request.urlopen(self.url, timeout=10)
+            self.fail("expected 502")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 502)
+            body = e.read().decode()
+            self.assertNotIn("127.0.0.1", body)
+            self.assertNotIn("http://", body)
+            self.assertIn("error", json.loads(body))
 
 
 class TestCors(RelayTestCase):
