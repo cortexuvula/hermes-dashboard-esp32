@@ -103,10 +103,10 @@ LGFX tft;
 #define STATUS_STATE_Y        110    // was 118 — its band overlapped the disk bar (120..126)
 #define STATUS_DISK_BAR_W     112
 #define STATUS_DISK_BAR_H     6
-#define STATUS_DISK_BAR_DY    34     // CENTER_Y + this
+#define STATUS_DISK_BAR_DY    32     // CENTER_Y + this (was 34 — clears the label)
 #define STATUS_DISK_LBL_DY    10     // disk_bar_y + this
 #define STATUS_FOOTER_DY      52     // CENTER_Y + this
-#define STATUS_DOT_DX         50     // CENTER_X + this (fixed, not text-relative)
+#define STATUS_DOT_DX         54     // CENTER_X + this (fixed inset; 54 keeps it clear of the bounded footer)
 #define STATUS_DOT_R          3
 
 // TOKENS page
@@ -648,11 +648,19 @@ void draw_footer() {
     tft.setTextColor(C_DIM, C_BG);
     tft.setTextDatum(MC_DATUM);
     int footer_y = CENTER_Y + STATUS_FOOTER_DY;
+    // Bound the footer text: version_str and profile_count are SERVER-DRIVEN, so an
+    // unbounded string ("v0.100.100  100 bots") would run into the update dot while
+    // the layout gate stayed green. Both fields are clamped so the footer's worst case
+    // is exactly what tools/check_layout.py models ("v0.21.3 99+ bots", 16 chars).
+    String ver_short = version_str;
+    if (ver_short.length() > 6) ver_short = ver_short.substring(0, 6);
+    String bots = profile_count;
+    if (bots.length() > 3) bots = "99+";
     String footer;
     if (profile_known) {
-        footer = "v" + version_str + "  " + profile_count + " bots";
+        footer = "v" + ver_short + " " + bots + " bots";
     } else {
-        footer = "v" + version_str;
+        footer = "v" + ver_short;
     }
     tft.drawString(footer, CENTER_X, footer_y);
 

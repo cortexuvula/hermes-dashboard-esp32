@@ -9,9 +9,19 @@ firmware drifts:
                   draw call, so changing a font in the sketch changes this check.
 
 Every drawn element is modelled with a WORST-CASE string (longest version,
-two-digit bot count, 6-char token totals, "--" states) and
+bounded bot count, 6-char token totals, "--" states) and
 tested against the round aperture:  r <= ROUND_R  where ROUND_R is parsed from
 the sketch (the project's own "usable radius inside round glass").
+
+THIRD PROPERTY — ELEMENT VS ELEMENT (the aperture test cannot see it):
+  A layout can keep every element inside the circle and still draw two of them on
+  top of each other; that shipped once ("text overlapping" on STATUS and HEALTH,
+  reported from the hardware).  So every element also gets a VISUAL box — glyph
+  band height (GLYPH_H), not the em box, which would make adjacent lines look
+  like collisions — and all same-page pairs are intersected; anything overlapping
+  by more than MIN_OVERLAP_PX fails.  The modelled strings are data-shape aware:
+  the footer is server-driven, so the sketch BOUNDS it and WORST["FOOTER"] models
+  exactly that bound.
 
 Envelope formula (center CX,CY):
   centered text : r = hypot(w/2, |y - CY| + h/2)
@@ -26,12 +36,18 @@ Envelope formula (center CX,CY):
     and no draw line may be claimed twice.  A duplicated or moved element FAILS.
 
 Usage:
-  python3 tools/check_layout.py               # current sketch: expect PASS (exit 0)
-  python3 tools/check_layout.py --prefix      # original pre-audit coordinates:
-                                              # must FAIL (exit 1) — proves the gate
-                                              # detects the A11 defects
-  python3 tools/check_layout.py --sketch P    # check a different sketch file
-                                              # (used to prove drift is detected)
+  python3 tools/check_layout.py                  # current sketch: expect PASS (exit 0)
+                                                 # (aperture + completeness + overlap)
+  python3 tools/check_layout.py --prefix         # original pre-audit coordinates:
+                                                 # must FAIL (exit 1) — proves the gate
+                                                 # detects the A11 defects
+  python3 tools/check_layout.py --overlap-prefix # the layout as reported on hardware
+                                                 # (SESSIONS 100, STATE 118, AUTH 134,
+                                                 # dot dx 50): must FAIL (exit 1) —
+                                                 # proves the overlap check detects the
+                                                 # "text overlapping" defect it exists for
+  python3 tools/check_layout.py --sketch P       # check a different sketch file
+                                                 # (used to prove drift is detected)
 """
 import math
 import re
@@ -135,7 +151,7 @@ WORST = {
     "STATE": "DEGRADED",
     "OVERFLOW": "+99",
     "DISK": "DISK 100%",
-    "FOOTER": "v0.21.3  99 bots",
+    "FOOTER": "v0.21.3 99+ bots",   # sketch bounds version to 6 chars + count to 3 ("99+")
     "TK_HEAD": "TOKENS 24H",
     "TK_QUAL": "NEW SESSIONS ONLY",
     "TK_BIG": "12345M",              # 6-char DejaVu40 worst case (staleness shown via dim color, not "?" suffix)
@@ -402,12 +418,33 @@ def check(sk, prefix=False):
 # check must use the height the glyphs actually occupy, or every adjacent line looks
 # like an overlap. Values are the drawn cap/ascender band for each family; Font2 is an
 # 8x16 cell whose glyphs occupy ~12 px, DejaVu40 digits ~28 px.
-GLYPH_H = {"Font0": 7, "Font2": 12, "DejaVu24": 18, "DejaVu40": 28}
+GLYPH_H = {"Font0": 7, "Font2": 13, "DejaVu24": 19, "DejaVu40": 29}
+
+# Minimum intersection (px) that counts as a collision. Deliberately below 1.0 so a
+# sub-pixel glyph kiss is reported rather than excluded by a strict > test.
+MIN_OVERLAP_PX = 0.5
+
+# Number of visual boxes the overlap model must produce. The box list is built from the
+# same constants as the aperture check but is a SEPARATE list, so this asserts it cannot
+# silently diverge: add an element (or a box) and this fails until you reconcile them.
+EXPECTED_BOXES = 40
 
 
-def overlap_boxes(sk, cx, cy):
-    """Every drawn element as a visual box, per page, from the parsed constants."""
+def overlap_boxes(sk, cx, cy, prefix=False):
+    """Every drawn element as a visual box, per page, from the parsed constants.
+
+    prefix=True models the layout as REPORTED ON HARDWARE (SESSIONS 100, STATE 118,
+    AUTH 134, dot dx 50) — the state of the display before the overlap fix. Used by
+    --overlap-prefix, which must FAIL.
+    """
     out = []  # (page, name, x0, x1, y0, y1)
+
+    def val(name, normal):
+        """Pre-fix override for the four constants involved in the reported defect."""
+        if not prefix:
+            return sk.val(name)
+        return {"STATUS_SESS_Y": 100, "STATUS_STATE_Y": 118,
+                "HL_AUTH_Y": 134, "STATUS_DOT_DX": 50}.get(name, sk.val(name))
 
     def txt(page, name, x, y, s, font):
         w = text_w(s, font)
@@ -429,15 +466,15 @@ def overlap_boxes(sk, cx, cy):
     txt("STATUS", "overflow +99", cx + sk.val("STATUS_OVERFLOW_DX"),
         cy - sk.val("STATUS_OVERFLOW_DY"), WORST["OVERFLOW"], "Font0")
     txt("STATUS", "number", cx, sk.val("STATUS_NUM_Y"), "999", "DejaVu40")
-    txt("STATUS", "SESSIONS", cx, sk.val("STATUS_SESS_Y"), WORST["SESSIONS"], "Font2")
-    txt("STATUS", "state", cx, sk.val("STATUS_STATE_Y"), WORST["STATE"], "Font2")
+    txt("STATUS", "SESSIONS", cx, val("STATUS_SESS_Y", None), WORST["SESSIONS"], "Font2")
+    txt("STATUS", "state", cx, val("STATUS_STATE_Y", None), WORST["STATE"], "Font2")
     bar_y = cy + sk.val("STATUS_DISK_BAR_DY")
     bar_w, bar_h = sk.val("STATUS_DISK_BAR_W"), sk.val("STATUS_DISK_BAR_H")
     rect("STATUS", "disk bar", cx - bar_w / 2.0, bar_y, bar_w, bar_h)
     txt("STATUS", "disk label", cx, bar_y + sk.val("STATUS_DISK_LBL_DY"), WORST["DISK"], "Font0")
     foot_y = cy + sk.val("STATUS_FOOTER_DY")
     txt("STATUS", "footer", cx, foot_y, WORST["FOOTER"], "Font0")
-    circ("STATUS", "update dot", cx + sk.val("STATUS_DOT_DX"), foot_y, sk.val("STATUS_DOT_R"))
+    circ("STATUS", "update dot", cx + val("STATUS_DOT_DX", None), foot_y, sk.val("STATUS_DOT_R"))
 
     # ── TOKEN 24H and 7D (the two pages share the y positions but not the fonts) ──
     for page, det1 in (("TOKEN 24H", ("io", WORST["TK_IO"], "Font0")),
@@ -459,15 +496,15 @@ def overlap_boxes(sk, cx, cy):
         txt("HEALTH", f"row {i}", cx, y, WORST["HL_ROW"], "Font2")
         circ("HEALTH", f"row {i} dot", cx - sk.val("HL_DOT_DX"), y, sk.val("HL_DOT_R"))
     txt("HEALTH", "error 9E", cx + sk.val("HL_ERR_DX"), sk.val("HL_ERR_Y"), WORST["HL_ERR"], "Font0")
-    txt("HEALTH", "auth", cx, sk.val("HL_AUTH_Y"), WORST["HL_AUTH"], "Font2")
+    txt("HEALTH", "auth", cx, val("HL_AUTH_Y", None), WORST["HL_AUTH"], "Font2")
     txt("HEALTH", "host", cx, sk.val("HL_HOST_Y"), WORST["HL_HOST"], "Font0")
 
     return out
 
 
-def check_overlaps(sk, cx, cy, min_px=1.0):
+def check_overlaps(sk, cx, cy, prefix=False, min_px=MIN_OVERLAP_PX):
     """Pairwise collision check per page. Returns (box_count, [(page, a, b, ox, oy)])."""
-    boxes = overlap_boxes(sk, cx, cy)
+    boxes = overlap_boxes(sk, cx, cy, prefix=prefix)
     bad = []
     for i in range(len(boxes)):
         pi, ni, ax0, ax1, ay0, ay1 = boxes[i]
@@ -533,7 +570,25 @@ def main(argv):
 
     # OVERLAP CHECK — the aperture gate above cannot see two elements colliding.
     # Drawn on real hardware this is what "text overlapping" looks like.
-    n_boxes, overlaps = check_overlaps(sk, cx, cy)
+    n_boxes, overlaps = check_overlaps(sk, cx, cy, prefix=("--overlap-prefix" in argv))
+
+    # --overlap-prefix models the layout as REPORTED on hardware and must FAIL, so the
+    # gate's ability to detect this defect class is itself regression-tested.
+    if "--overlap-prefix" in argv:
+        if not overlaps:
+            print("GATE BROKEN — the reported pre-fix layout produced no collision; the "
+                  "overlap check cannot detect the defect it exists for.")
+            return 1
+        print(f"GATE OK — pre-fix layout correctly FAILS ({len(overlaps)} collision(s)):")
+        for page, a, b, ox, oy in overlaps:
+            print(f"  [{page}] {a} <-> {b}   overlap {ox:.1f}x{oy:.1f} px")
+        return 0
+
+    if n_boxes != EXPECTED_BOXES:
+        print(f"MODEL DRIFT: overlap model built {n_boxes} boxes, expected {EXPECTED_BOXES} — "
+              f"an element was added to one list and not the other. Reconcile them.")
+        return 1
+
     if overlaps:
         print()
         print(f"OVERLAP FAILURE: {len(overlaps)} element pair(s) collide on screen "

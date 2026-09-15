@@ -56,3 +56,20 @@ jobs:
               --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app \
               --output-dir /tmp/dash-build-home .
           fi
+
+  layout-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Layout gate — aperture, completeness, element-vs-element overlap
+        run: |
+          # 1. the current sketch must be clean on all three properties
+          python3 tools/check_layout.py
+          # 2. the pre-audit aperture defects (A11) must still be caught
+          if python3 tools/check_layout.py --prefix; then
+            echo "::error::--prefix passed; the aperture gate no longer detects the A11 defects"
+            exit 1
+          fi
+          # 3. the layout as reported on hardware ("text overlapping" on STATUS/HEALTH)
+          #    must still be caught — pins the defect this check exists for
+          python3 tools/check_layout.py --overlap-prefix
