@@ -6,9 +6,8 @@ ESP32-C6 desk widget that shows live Hermes gateway stats from `http://<host>:91
 `PROJECT.md`, `README.md`, `build-flash.sh`, the sketch, `wifi_config.h` (selector), the `.example`
 unit configs, `relay/`, `deploy/`. **Gitignored** (never publish): `wifi_config.work.h`,
 `wifi_config.home.h`, `build*/` — a compiled `merged.bin`/`.elf` embeds the WiFi PSK in plaintext.
-Local git note: after the Xcode 27 update, `/usr/bin/git` is blocked by the unaccepted Xcode license;
-use `/Library/Developer/CommandLineTools/usr/bin/git` (shimmed at `~/.hermes/localbin/git`) or run
-`sudo xcodebuild -license accept` once.
+Local git note: after the Xcode 27 update, `/usr/bin/git` was blocked by an unaccepted Xcode license;
+run `sudo xcodebuild -license accept` (done 2026-09-15 — both git and Homebrew work again).
 
 ## Architecture
 
