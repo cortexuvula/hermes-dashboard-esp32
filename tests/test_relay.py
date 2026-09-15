@@ -284,6 +284,31 @@ class TestNonBlocking(RelayTestCase):
                         f"header-drip upstream answered after {elapsed:.2f}s, "
                         f"budget {relay.STATUS_TIMEOUT}s exceeded")
 
+    def test_over_budget_fetch_releases_worker_and_fd(self):
+        # S2: when the join deadline expires, the fetch socket is
+        # force-closed so the abandoned worker exits promptly — repeated
+        # over-budget polls must not accumulate worker threads.
+        self.handler.status_delay = 30.0   # upstream never answers in time
+
+        def workers():
+            return [t for t in threading.enumerate()
+                    if t.name == "relay-upstream-fetch"]
+
+        for _ in range(5):
+            t0 = time.monotonic()
+            try:
+                urllib.request.urlopen(self.url, timeout=30)
+                self.fail("expected 502")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 502)
+                e.read()
+            self.assertLess(time.monotonic() - t0,
+                            relay.STATUS_TIMEOUT + 1.0)
+        time.sleep(0.5)  # let the abandoned workers observe the closed socket
+        self.assertEqual(len(workers()), 0,
+                         "abandoned fetch workers are lingering (S2)")
+        self.handler.status_delay = 0.0
+
     def test_stalled_usage_does_not_block_response(self):
         # usage upstream hangs forever; relay must still answer fast (A5)
         self.cfg.refresher.url = self.usage_url
@@ -415,7 +440,7 @@ class TestUsageAge(RelayTestCase):
         self.assertEqual(data["usage_age_s"], 0)
 
     def test_implausible_generated_at_treated_as_unknown(self):
-        # R3: negative / zero / absurdly-far-future producer timestamps
+        # R3: negative / zero / absurdly-far-FUTURE producer timestamps
         # must not yield a nonsense age (epoch-negative used to produce
         # ~1_800_005_000 s) nor be forwarded as-is.
         for ga in (-5000, 0, int(time.time()) + 48 * 3600):
@@ -434,6 +459,31 @@ class TestUsageAge(RelayTestCase):
             self.assertLess(data["usage_age_s"], 120,
                             f"nonsense age for generated_at={ga}: "
                             f"{data['usage_age_s']}")
+
+    def test_arbitrarily_old_data_reports_true_age(self):
+        # S1: OLD producer timestamps are the truth, not nonsense — the
+        # old ±24 h window rejected the past direction and fell back to
+        # FETCH time, reporting ~0 s ("fresh") for exactly the stalest
+        # data (usage-server serving last-good for days). 25 h / 48 h /
+        # 7 d must report the true large age; 23 h (inside the old
+        # window) must keep working.
+        for label, age_s in (("23h", 23 * 3600), ("25h", 25 * 3600),
+                             ("48h", 48 * 3600), ("7d", 7 * 86400)):
+            stale = dict(SAMPLE_USAGE)
+            stale["generated_at"] = int(time.time()) - age_s
+            self.handler.usage_body = json.dumps(stale).encode()
+            self.cfg.refresher.interval = 0.05
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                _, data = self.get()
+                if data["generated_at"] == stale["generated_at"]:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(data["generated_at"], stale["generated_at"])
+            self.assertGreater(data["usage_age_s"], age_s - 120,
+                               f"{label}-old data reported age "
+                               f"{data['usage_age_s']}s — must be ~{age_s}s, "
+                               f"not fresh")
 
     def test_age_null_when_never_had_data(self):
         cfg = relay.RelayConfig(self.status_url, "http://127.0.0.1:9/")

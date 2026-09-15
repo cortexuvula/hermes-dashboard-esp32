@@ -26,10 +26,14 @@ Contract (schema 2) — see the CONTRACT section in ../README.md:
   - Unavailable usage data is JSON null, never omitted, never zeroed
     (tokens_24h / tokens_7d / host).
   - usage_age_s  int|null  age of the usage DATA: seconds since the
-    producer's generated_at (falling back to the relay's fetch time only
-    when generated_at is absent), clamped >= 0. The board has no clock,
-    and usage-server may serve its last-good payload indefinitely, so
-    this producer-side age is the only staleness signal (Finding 2).
+    producer's generated_at, clamped >= 0. Arbitrarily OLD timestamps
+    are accepted and reported truthfully (a large age is real
+    staleness, not nonsense); only non-positive or implausibly
+    FUTURE (>24 h ahead — clock skew) timestamps are treated as
+    unknown, falling back to the relay's fetch time. The board has no
+    clock, and usage-server may serve its last-good payload
+    indefinitely, so this producer-side age is the only staleness
+    signal (Finding 2/S1).
   - generated_at int|null  epoch seconds, forwarded from usage-server.
   - schema       int       contract version (2).
 
@@ -45,6 +49,7 @@ browser consumer needs it).
 """
 
 import argparse
+import http.client
 import http.server
 import json
 import socket
@@ -99,13 +104,14 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
     trickles bytes or HEADER LINES (each recv completing inside the socket
     timeout) could otherwise hold the caller arbitrarily long (Finding 1
     + R1). The fetch therefore runs on a daemon worker thread which the
-    caller joins with the remaining budget; if the worker is still alive
-    at the deadline it is abandoned (daemon threads never block exit) and
-    the caller raises. Inside the worker, a monotonic deadline is checked
-    before every body read and the socket timeout is re-armed to the
-    REMAINING budget, so a well-behaved upstream aborts on its own
-    without waiting to be abandoned. The byte cap is enforced even when
-    the length is unknown or chunked (A9).
+    caller joins with the remaining budget; at the deadline the fetch
+    socket is FORCE-CLOSED so the abandoned worker's blocked operation
+    raises immediately, its file descriptor is released promptly, and
+    repeated over-budget polls do not accumulate workers (S2). Inside the
+    worker, a monotonic deadline is checked before every body read and the
+    socket timeout is re-armed to the REMAINING budget, so a well-behaved
+    upstream aborts on its own without waiting to be abandoned. The byte
+    cap is enforced even when the length is unknown or chunked (A9).
 
     Raises UpstreamError on transport failure, over-budget or over-cap.
     """
@@ -115,8 +121,12 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
     def _work():
         try:
             result["body"] = _fetch_body(url, deadline, cap)
-        except Exception as e:  # includes UpstreamError
+        except UpstreamError as e:
             result["error"] = e
+        except Exception as e:  # timeout, DNS, HTTP error, ... — keep the
+            # contract: _fetch_capped raises UpstreamError, never raw
+            # transport exceptions
+            result["error"] = UpstreamError(str(e))
 
     def _arm(sock, remaining):
         # Bound the NEXT blocking operation by the remaining budget only.
@@ -125,22 +135,35 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
         except Exception:
             pass
 
+    # S2: the fetch's socket is registered the moment it connects, so an
+    # over-budget fetch can be force-closed from the caller — the abandoned
+    # worker's blocked operation raises immediately and its FD is released
+    # promptly instead of lingering until the upstream's own timeouts fire.
+    sock_holder: dict = {"sock": None}
+
+    class _RegisteringHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            super().connect()
+            sock_holder["sock"] = self.sock
+
+    class _RegisteringHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_RegisteringHTTPConnection, req)
+
+    opener = urllib.request.build_opener(_RegisteringHandler)
+
     def _fetch_body(url, deadline, cap):
         req = urllib.request.Request(url,
                                      headers={"Accept": "application/json"})
         # An urllib timeout equal to the full budget bounds connect/status
         # line/each header line individually; the join() deadline below is
         # what bounds the phases collectively.
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             # read1 returns as soon as ANY bytes are available; a plain
             # read(8192) on a length-delimited body blocks until the full
             # amount arrives, which would ignore the deadline between reads.
             reader = getattr(resp, "read1", None) or resp.read
-            sock = None
-            try:  # http.client: BufferedReader → SocketIO → socket
-                sock = resp.fp.raw._sock
-            except Exception:
-                pass
+            sock = sock_holder["sock"]
             chunks, total = [], 0
             while True:
                 remaining = deadline - time.monotonic()
@@ -164,9 +187,20 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        # Still running past the deadline: abandon it (daemon — it dies
-        # with the process; its socket closes when it next times out on
-        # its own re-armed timeouts) and report the over-budget.
+        # Over budget: force-close the fetch socket so the abandoned
+        # worker's blocked recv/send raises immediately and the FD is
+        # released now (S2), then report the over-budget. The worker
+        # itself is daemon-scoped and finishes within moments.
+        sock = sock_holder["sock"]
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
         raise UpstreamError(
             f"upstream exceeded total budget of {timeout}s: {url}")
     if "error" in result:
@@ -215,18 +249,21 @@ class UsageRefresher(threading.Thread):
             return self._snapshot, self._taken_at
 
 
-# A producer timestamp outside this window of the relay's clock is treated
-# as unknown (R3): a negative or absurdly-far-future generated_at would
-# otherwise yield a nonsense age (~1.8 Gs for epoch-negative values) or be
-# forwarded as-is. Both cases fall back to the fetch-time age path.
-GENERATED_AT_MAX_SKEW_S = 24 * 3600  # ±1 day around the relay's clock
+# Producer-timestamp plausibility bound (S1): reject ga <= 0 outright, and
+# reject ga more than this far in the FUTURE of the relay's clock (that
+# direction is clock skew). Arbitrarily OLD past timestamps are ACCEPTED —
+# a huge age is the truth (usage-server serves last-good indefinitely),
+# and the board's own >60 s rule decides what to show. Never "fix" an old
+# timestamp by falling back to fetch time: that reports FRESH for exactly
+# the stalest data the field exists to expose.
+GENERATED_AT_MAX_FUTURE_S = 24 * 3600  # max plausible clock skew ahead
 
 
 def _sanitize_generated_at(ga, now):
-    """Return a plausible producer timestamp or None (R3)."""
+    """Return a plausible producer timestamp or None (R3/S1)."""
     if not isinstance(ga, (int, float)) or isinstance(ga, bool):
         return None
-    if ga <= 0 or abs(now - ga) > GENERATED_AT_MAX_SKEW_S:
+    if ga <= 0 or ga > now + GENERATED_AT_MAX_FUTURE_S:
         return None
     return ga
 
