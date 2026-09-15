@@ -40,6 +40,7 @@ EOF
 
 # ── stubs that log pwd + args, and fake a successful build artifact
 LOG="$SANDBOX/calls.log"
+export LOG   # stubs are written with quoted heredocs; they log via \$LOG
 cat > "$SANDBOX/stub/arduino-cli" <<EOF
 #!/usr/bin/env bash
 echo "arduino-cli pwd=\$(pwd) args=\$*" >> "$LOG"
@@ -181,17 +182,17 @@ fi
 mv "$SANDBOX/h.conf" "$SANDBOX/hermes-dash-esp32/wifi_config.home.h"
 
 # 10. marker mismatch → refuse to proceed (simulated bad image)
-cat > "$SANDBOX/stub/arduino-cli" <<EOF
+cat > "$SANDBOX/stub/arduino-cli" <<'EOF'
 #!/usr/bin/env bash
-echo "arduino-cli pwd=\$(pwd) args=\$*" >> "$LOG"
-if [[ "\$1" == "compile" ]]; then
+echo "arduino-cli pwd=$(pwd) args=$*" >> "$LOG"
+if [[ "$1" == "compile" ]]; then
   out=""
-  while [[ \$# -gt 0 ]]; do
-    [[ "\$1" == "--output-dir" ]] && { shift; out="\$1"; }
+  while [[ $# -gt 0 ]]; do
+    [[ "$1" == "--output-dir" ]] && { shift; out="$1"; }
     shift
   done
-  mkdir -p "\$out"
-  printf 'WRONG-IMAGE-CONTENTS\n' > "\$out/hermes-dash-esp32.ino.merged.bin"
+  mkdir -p "$out"
+  printf 'WRONG-IMAGE-CONTENTS\n' > "$out/hermes-dash-esp32.ino.merged.bin"
 fi
 exit 0
 EOF
@@ -214,6 +215,61 @@ else
   bad "absent sketch dir not handled: rc=$rc out=[$out]"
 fi
 mv "$SANDBOX/sketch.bak" "$SANDBOX/hermes-dash-esp32"
+
+# 12. R2: garbage from remote mktemp → non-zero, clear message, and the
+# cleanup NEVER rm -rf's the unvalidated string (only validated paths)
+cat > "$SANDBOX/stub/ssh" <<'EOF'
+#!/usr/bin/env bash
+echo "ssh pwd=$(pwd) args=$*" >> "$LOG"
+if [[ "$*" == *"mktemp -d"* ]]; then echo "WEIRDOUTPUT"; exit 0; fi
+exit 0
+EOF
+chmod +x "$SANDBOX/stub/ssh"
+# restore a good compile stub first (test 10 replaced it with the bad-image one)
+cat > "$SANDBOX/stub/arduino-cli" <<'EOF'
+#!/usr/bin/env bash
+echo "arduino-cli pwd=$(pwd) args=$*" >> "$LOG"
+if [[ "$1" == "compile" ]]; then
+  out=""
+  while [[ $# -gt 0 ]]; do
+    [[ "$1" == "--output-dir" ]] && { shift; out="$1"; }
+    shift
+  done
+  mkdir -p "$out"
+  printf 'testSsidHome\ntestSsidWork\n192.168.1.171\n192.168.4.37\n' > "$out/hermes-dash-esp32.ino.merged.bin"
+fi
+exit 0
+EOF
+chmod +x "$SANDBOX/stub/arduino-cli"
+reset
+out="$(run home --flash 2>&1)"; rc=$?
+rmcount="$(grep -c 'rm -rf' "$LOG" 2>/dev/null || true)"
+rmtargets="$(grep 'rm -rf' "$LOG" 2>/dev/null || true)"
+if [[ $rc -ne 0 && "$out" == *"FAIL: remote did not return a valid temp dir"* ]]; then
+  if [[ "$rmcount" -eq 0 ]]; then
+    ok "R2: garbage mktemp output → non-zero + clear message, NO rm -rf issued"
+  else
+    bad "R2: cleanup rm -rf'd an unvalidated path: [$rmtargets]"
+  fi
+else
+  bad "R2: garbage mktemp not handled: rc=$rc out=[$out] rm=[$rmtargets]"
+fi
+# and confirm a VALID run still cleans up (regression: guard must not
+# disable legitimate cleanup)
+cat > "$SANDBOX/stub/ssh" <<'EOF'
+#!/usr/bin/env bash
+echo "ssh pwd=$(pwd) args=$*" >> "$LOG"
+if [[ "$*" == *"mktemp -d"* ]]; then echo "/tmp/hermes-dash.ABC12345"; exit 0; fi
+exit 0
+EOF
+chmod +x "$SANDBOX/stub/ssh"
+reset
+out="$(run home --flash 2>&1)"; rc=$?
+if [[ $rc -eq 0 && "$(grep -c "rm -rf '/tmp/hermes-dash.ABC12345'" "$LOG")" -ge 1 ]]; then
+  ok "R2: valid mktemp path still cleaned up by the guarded cleanup"
+else
+  bad "R2: guarded cleanup skipped legitimate cleanup: rc=$rc log=[$(cat "$LOG")]"
+fi
 
 echo
 echo "passed=$PASS failed=$FAIL"

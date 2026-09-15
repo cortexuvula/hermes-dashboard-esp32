@@ -40,9 +40,25 @@ class SlowHandler(http.server.BaseHTTPRequestHandler):
     # delay, Content-Length declared (Finding 1: every individual recv
     # completes well inside the socket timeout)
     status_drip = 0.0
+    # header_drip > 0 → send the status line, then trickle HEADER bytes
+    # at that delay (R1: header phase must respect the total budget)
+    header_drip = 0.0
 
     def do_GET(self):
         if self.path.startswith("/api/status"):
+            if self.header_drip > 0:
+                self.wfile.write(b"HTTP/1.0 200 OK\r\n")
+                self.wfile.flush()
+                for line in (b"Content-Type: application/json\r\n",
+                             f"Content-Length: "
+                             f"{len(self.status_body)}\r\n".encode(),
+                             b"\r\n"):
+                    for i in range(len(line)):
+                        self.wfile.write(line[i:i + 1])
+                        self.wfile.flush()
+                        time.sleep(self.header_drip)
+                self.wfile.write(self.status_body)
+                return
             if self.status_drip > 0:
                 time.sleep(self.status_delay)
                 self.send_response(self.status_code)
@@ -114,7 +130,8 @@ SAMPLE_USAGE = {
            "api_calls": 30, "sessions": 9, "est_cost": 4.2, "total": 360},
     "host": {"cpu_percent": 12, "load_percent": 34, "ram_used_percent": 61,
              "ram_total_mb": 32768, "secret": "no"},
-    "generated_at": 1757900000,
+    "generated_at": None,  # per-test: set fresh — a fixed epoch would be
+                           # >1 d old and (correctly) sanitized to null (R3)
     "window_basis": "session_started_at",
 }
 
@@ -201,9 +218,18 @@ class TestNullSemantics(RelayTestCase):
         self.assertIsNone(data["components"])
 
     def test_schema_and_generated_at_forwarded(self):
-        _, data = self.get()
+        fresh = dict(SAMPLE_USAGE)
+        fresh["generated_at"] = int(time.time()) - 2
+        self.handler.usage_body = json.dumps(fresh).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == fresh["generated_at"]:
+                break
+            time.sleep(0.05)
         self.assertEqual(data["schema"], 2)
-        self.assertEqual(data["generated_at"], SAMPLE_USAGE["generated_at"])
+        self.assertEqual(data["generated_at"], fresh["generated_at"])
 
     def test_usage_age_s_int(self):
         fresh = dict(SAMPLE_USAGE)
@@ -238,6 +264,24 @@ class TestNonBlocking(RelayTestCase):
         elapsed = time.monotonic() - t0
         self.assertLess(elapsed, relay.STATUS_TIMEOUT + 1.0,
                         f"drip upstream answered after {elapsed:.2f}s, "
+                        f"budget {relay.STATUS_TIMEOUT}s exceeded")
+
+    def test_header_drip_bounded_by_total_budget(self):
+        # R1: an upstream that sends the status line then TRICKLES THE
+        # HEADERS (1 byte per 0.5 s, every recv inside the per-op socket
+        # timeout) must not hold the response past the total budget.
+        # Old code bounded the body loop only → measured 7.02 s stuck.
+        self.handler.header_drip = 0.5
+        t0 = time.monotonic()
+        try:
+            urllib.request.urlopen(self.url, timeout=30)
+            self.fail("expected 502 for over-budget header-drip upstream")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 502)
+            e.read()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, relay.STATUS_TIMEOUT + 1.0,
+                        f"header-drip upstream answered after {elapsed:.2f}s, "
                         f"budget {relay.STATUS_TIMEOUT}s exceeded")
 
     def test_stalled_usage_does_not_block_response(self):
@@ -369,6 +413,27 @@ class TestUsageAge(RelayTestCase):
             time.sleep(0.05)
         self.assertEqual(data["generated_at"], future["generated_at"])
         self.assertEqual(data["usage_age_s"], 0)
+
+    def test_implausible_generated_at_treated_as_unknown(self):
+        # R3: negative / zero / absurdly-far-future producer timestamps
+        # must not yield a nonsense age (epoch-negative used to produce
+        # ~1_800_005_000 s) nor be forwarded as-is.
+        for ga in (-5000, 0, int(time.time()) + 48 * 3600):
+            stale = dict(SAMPLE_USAGE)
+            stale["generated_at"] = ga
+            self.handler.usage_body = json.dumps(stale).encode()
+            self.cfg.refresher.interval = 0.05
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                _, data = self.get()
+                if data["generated_at"] is None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNone(data["generated_at"])
+            self.assertIsNotNone(data["usage_age_s"])  # fetch-time fallback
+            self.assertLess(data["usage_age_s"], 120,
+                            f"nonsense age for generated_at={ga}: "
+                            f"{data['usage_age_s']}")
 
     def test_age_null_when_never_had_data(self):
         cfg = relay.RelayConfig(self.status_url, "http://127.0.0.1:9/")

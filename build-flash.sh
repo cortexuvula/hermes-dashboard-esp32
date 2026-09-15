@@ -132,8 +132,12 @@ echo "    markers    : SSID '$SSID_MARKER', host '$URL_MARKER' (verified in imag
 echo "======================================================================="
 
 REMOTE_TMP=""
+# R2: cleanup must NEVER rm -rf a string the wrapper has not validated —
+# the trap is armed before validation (N1), so a remote that prints a
+# stray line (e.g. an error naming a real directory) must not get it
+# deleted. Re-check the mktemp pattern here, independently.
 cleanup_remote() {
-  if [[ -n "$REMOTE_TMP" ]]; then
+  if [[ -n "$REMOTE_TMP" && "$REMOTE_TMP" == /tmp/hermes-dash.* && "$REMOTE_TMP" != *" "* ]]; then
     ssh "$REMOTE" "rm -rf '$REMOTE_TMP'" || echo "WARN: could not remove remote temp dir $REMOTE_TMP" >&2
   fi
 }

@@ -60,16 +60,18 @@ qualifier for these numbers (firmware ≥ schema 2).
 Upstream read caps: status ≤ 128 KB, usage ≤ 32 KB — oversize upstream
 responses fail predictably (502 / null usage fields).
 
-Relay timing: the upstream status fetch runs under a hard TOTAL budget
-(3.0 s by default) enforced against a monotonic deadline inside the relay —
-not merely a per-socket-operation timeout — so even an upstream that
-trickles bytes (each recv completing inside the socket timeout) is
-aborted at the budget. Worst-case response ≈ the status budget plus the
-response write (~3.1 s observed), comfortably inside the board's 8 s HTTP
-wait. Usage is fetched by a background refresher and NEVER blocks a
-response. If the status fetch fails the relay answers 502 with a generic
-`{"error": …}` (upstream detail goes to the relay log only) and the board
-renders OFFLINE.
+Relay timing: the ENTIRE upstream status fetch — connect, status line,
+headers, and body — runs under a hard total budget (3.0 s by default).
+The fetch executes on a worker thread that the relay abandons at the
+budget, so even an upstream that trickles body bytes or header lines
+(each recv completing inside the socket timeout) cannot hold a
+response or a concurrency slot past the budget. Worst-case response ≈
+the budget plus the response write (~3.1 s observed), comfortably
+inside the board's 8 s HTTP wait. Usage is fetched by a background
+refresher under the same total-budget discipline and NEVER blocks a
+response. If the status fetch fails the relay answers 502 with a
+generic `{"error": …}` (upstream detail goes to the relay log only) and
+the board renders OFFLINE.
 
 Connection-layer limit (accepted, documented): the relay spawns a thread
 and file descriptor per accepted connection BEFORE the concurrency

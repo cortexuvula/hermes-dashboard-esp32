@@ -7,9 +7,12 @@ not merely a per-socket-operation timeout — plus a 128 KB read cap) and
 re-serves an ALLOWLISTED compact object on :9120 for the ESP32 on the
 LAN. Token-usage totals and host stats come from usage-server (:9121)
 via a background refresher thread — a stalled or trickling usage upstream
-can NEVER block or delay a response (audit A5). Worst-case response time
-is bounded by the status budget: the fetch is aborted at ~STATUS_TIMEOUT
-(3.0 s) + response write, comfortably inside the board's 8 s HTTP wait.
+can NEVER block or delay a response (audit A5). Every upstream fetch
+(status and usage alike) runs on a worker thread that the caller abandons
+at a hard total budget, so trickled BODY bytes and trickled HEADER lines
+are both bounded (Finding 1 + R1). Worst-case response time is bounded by
+the status budget: the fetch is abandoned at ~STATUS_TIMEOUT (3.0 s) +
+response write, comfortably inside the board's 8 s HTTP wait.
 
 Connection-layer limit (documented limitation, Finding 3): the relay
 spawns a thread + fd per accepted connection BEFORE the concurrency
@@ -53,11 +56,13 @@ import urllib.request
 UPSTREAM = "http://100.79.10.43:9119/api/status"  # Mac's Tailscale IP
 USAGE_URL = "http://100.79.10.43:9121/"            # usage-server on same host
 LISTEN_PORT = 9120
-# TOTAL budget for the whole upstream status fetch (connect + headers +
-# body), enforced against a monotonic deadline — a trickle of bytes that
-# completes each recv inside the socket timeout still aborts here (A5,
-# Finding 1). Worst-case response ≈ this + response write, inside the
-# board's 8 s HTTP wait.
+# TOTAL budget for the whole upstream status fetch — connect + status
+# line + HEADERS + body (R1: the header phase was previously unbounded) —
+# enforced by running the fetch on a worker thread joined with this
+# budget, plus an in-loop monotonic deadline for the body reads. A
+# trickle of bytes or header lines that completes each recv inside the
+# socket timeout still aborts here (A5, Finding 1, R1). Worst-case
+# response ≈ this + response write, inside the board's 8 s HTTP wait.
 STATUS_TIMEOUT = 3.0
 USAGE_TIMEOUT = 2.0       # background refresher only, never on request path
 USAGE_REFRESH = 5.0       # background refresh interval (board polls ~10 s)
@@ -89,18 +94,29 @@ class UpstreamError(Exception):
 def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
     """GET url with a TOTAL time budget and a hard byte cap.
 
-    `timeout` bounds the WHOLE fetch, not each recv: urllib's timeout is
-    per-socket-operation, so an upstream that trickles bytes (each read
-    completing inside the socket timeout) could otherwise hold the caller
-    arbitrarily long (Finding 1). A monotonic deadline is checked before
-    every read and the socket timeout is re-armed to the REMAINING budget,
-    so no single read can overshoot the deadline by more than epsilon.
-    The byte cap is enforced even when the length is unknown or chunked
-    (A9).
+    `timeout` bounds the WHOLE fetch — connect + status line + headers +
+    body. urllib's timeout is per-socket-operation, so an upstream that
+    trickles bytes or HEADER LINES (each recv completing inside the socket
+    timeout) could otherwise hold the caller arbitrarily long (Finding 1
+    + R1). The fetch therefore runs on a daemon worker thread which the
+    caller joins with the remaining budget; if the worker is still alive
+    at the deadline it is abandoned (daemon threads never block exit) and
+    the caller raises. Inside the worker, a monotonic deadline is checked
+    before every body read and the socket timeout is re-armed to the
+    REMAINING budget, so a well-behaved upstream aborts on its own
+    without waiting to be abandoned. The byte cap is enforced even when
+    the length is unknown or chunked (A9).
 
     Raises UpstreamError on transport failure, over-budget or over-cap.
     """
     deadline = time.monotonic() + timeout
+    result: dict = {}
+
+    def _work():
+        try:
+            result["body"] = _fetch_body(url, deadline, cap)
+        except Exception as e:  # includes UpstreamError
+            result["error"] = e
 
     def _arm(sock, remaining):
         # Bound the NEXT blocking operation by the remaining budget only.
@@ -109,8 +125,12 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
         except Exception:
             pass
 
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
+    def _fetch_body(url, deadline, cap):
+        req = urllib.request.Request(url,
+                                     headers={"Accept": "application/json"})
+        # An urllib timeout equal to the full budget bounds connect/status
+        # line/each header line individually; the join() deadline below is
+        # what bounds the phases collectively.
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             # read1 returns as soon as ANY bytes are available; a plain
             # read(8192) on a length-delimited body blocks until the full
@@ -138,10 +158,20 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
                         f"upstream body exceeds {cap} byte cap: {url}")
                 chunks.append(chunk)
             return b"".join(chunks)
-    except UpstreamError:
-        raise
-    except Exception as e:  # timeout, DNS, HTTP error, ...
-        raise UpstreamError(str(e)) from e
+
+    worker = threading.Thread(target=_work, daemon=True,
+                              name="relay-upstream-fetch")
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        # Still running past the deadline: abandon it (daemon — it dies
+        # with the process; its socket closes when it next times out on
+        # its own re-armed timeouts) and report the over-budget.
+        raise UpstreamError(
+            f"upstream exceeded total budget of {timeout}s: {url}")
+    if "error" in result:
+        raise result["error"]
+    return result["body"]
 
 
 def _pick(obj, fields):
@@ -185,6 +215,22 @@ class UsageRefresher(threading.Thread):
             return self._snapshot, self._taken_at
 
 
+# A producer timestamp outside this window of the relay's clock is treated
+# as unknown (R3): a negative or absurdly-far-future generated_at would
+# otherwise yield a nonsense age (~1.8 Gs for epoch-negative values) or be
+# forwarded as-is. Both cases fall back to the fetch-time age path.
+GENERATED_AT_MAX_SKEW_S = 24 * 3600  # ±1 day around the relay's clock
+
+
+def _sanitize_generated_at(ga, now):
+    """Return a plausible producer timestamp or None (R3)."""
+    if not isinstance(ga, (int, float)) or isinstance(ga, bool):
+        return None
+    if ga <= 0 or abs(now - ga) > GENERATED_AT_MAX_SKEW_S:
+        return None
+    return ga
+
+
 def build_payload(status: dict, refresher: UsageRefresher, now=None) -> dict:
     """Assemble the schema-2 response: allowlisted status keys + usage."""
     payload = {k: status.get(k) for k in STATUS_ALLOWLIST}  # missing → null
@@ -192,7 +238,7 @@ def build_payload(status: dict, refresher: UsageRefresher, now=None) -> dict:
 
     usage, taken_at = refresher.snapshot() if refresher else (None, None)
     ga = usage.get("generated_at") if isinstance(usage, dict) else None
-    ga = ga if isinstance(ga, (int, float)) and not isinstance(ga, bool) else None
+    ga = _sanitize_generated_at(ga, now)
     payload["tokens_24h"] = _pick(usage.get("h24"), TOKEN_FIELDS) \
         if isinstance(usage, dict) else None
     payload["tokens_7d"] = _pick(usage.get("d7"), TOKEN_FIELDS) \
