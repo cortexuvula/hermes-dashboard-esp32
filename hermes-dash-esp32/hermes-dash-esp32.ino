@@ -200,6 +200,7 @@ const unsigned long FETCH_INTERVAL = 10000; // 10s poll
 bool fetch_ok = false;
 String last_sig;          // flicker fix: last ui_signature() that was painted
 bool error_shown = false; // flicker fix: offline screen painted once per outage
+bool force_repaint = false; // flicker fix: a screen other than the data page is up
 int  active_sessions = 0;
 bool active_sessions_known = false;
 bool gateway_busy    = false;
@@ -262,6 +263,13 @@ const int MAX_RESPONSE_SIZE = 32768;
 static inline bool is_stale() { return !g_age_known || g_usage_age_s > 60; }
 
 String fmt_tokens(long long v);   // defined below; ui_signature() formats through it
+
+// Host metrics are DISPLAYED quantised to 5%. They churn by 1-2% on every poll, and
+// because the repaint signature is built from displayed values, that wobble re-enabled a
+// full-screen repaint (and so a flash) nearly every 10s. Quantising here — at the single
+// assignment site — keeps the screen, the signature and the repaint trigger in agreement,
+// and a +/-4% CPU reading is immaterial on a status display.
+static inline int q5(int v) { return (v / 5) * 5; }
 
 // ── Flicker fix: change detection ─────────────────────
 // The panel is written directly (no canvas buffer), so EVERY repaint begins with a
@@ -556,10 +564,10 @@ bool fetch_dashboard() {
     JsonObject host = doc["host"];
     if (!host.isNull() && doc.containsKey("host")) {
         if (host["cpu_percent"].is<int>()) {
-            host_cpu = host["cpu_percent"].as<int>();
+            host_cpu = q5(host["cpu_percent"].as<int>());
         }
         if (host["ram_used_percent"].is<int>()) {
-            host_ram = host["ram_used_percent"].as<int>();
+            host_ram = q5(host["ram_used_percent"].as<int>());
         }
         g_host_known = host["cpu_percent"].is<int>() && host["ram_used_percent"].is<int>();
     } else {
@@ -899,6 +907,10 @@ void setup() {
     tft.setRotation(1);   // LANDSCAPE: 320x172, 90° CW (USB port to the right; use 3 to flip)
     tft.setBrightness(128); // 50% max per Waveshare warning
     tft.fillScreen(C_BG);
+    // Memory headroom — max alloc is the number that decides whether a full-screen
+    // canvas sprite (320x172x16bpp ~= 110 KB) can be allocated for flicker-free redraws.
+    Serial.printf("[dash] heap: free %u, max alloc %u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
     // Boot screen
     tft.setTextColor(C_ACCENT, C_BG);
@@ -960,23 +972,32 @@ void loop() {
 
         if (WiFi.status() != WL_CONNECTED) {
             wifi_connect();
+            // wifi_connect() ends with fillScreen(), so the panel is BLANK afterwards;
+            // without this the data page stays blank until the next change or rotation.
+            force_repaint = true;
         }
 
         fetch_ok = fetch_dashboard();
         if (fetch_ok) {
             last_success = millis();  // #1 A12: stamp AFTER success, not before
+            // Recovery must repaint regardless of the signature: if a poll failed (the
+            // offline screen is on the panel) and the next one succeeds with UNCHANGED
+            // data, an unchanged signature would otherwise leave OFFLINE stuck on screen.
+            bool recovered = error_shown;
             error_shown = false;
             // FLICKER FIX: repaint only when a value the UI draws actually changed — an
             // unchanged poll used to flash the entire panel for nothing.
             String sig = ui_signature();
-            if (sig != last_sig) {
+            if (recovered || force_repaint || sig != last_sig) {
                 last_sig = sig;
+                force_repaint = false;
                 render(current_page);
             }
         } else if (!error_shown) {
             // Paint the offline screen ONCE per outage, not every 10s.
             show_error();
             error_shown = true;
+            force_repaint = false;   // the offline screen is now the intended display
         }
     }
 
