@@ -36,19 +36,26 @@ dashboard `GET /api/status` (as of Hermes v0.2x).
 | `profiles` | array | upstream profile list (count shown) |
 | `nous_session_valid` | string | `"valid"`/… |
 | `components` | object\|null | passes through; **null if upstream omits it** (never fabricated) |
-| `tokens_24h`, `tokens_7d` | object\|null | `{total, input, output, cache, reasoning, api_calls, sessions, est_cost}` — **all-or-nothing (S3)**: if ANY field is absent, null, or not a real number (strings/booleans rejected) the whole object is null, never partial, never zero-filled. The board renders null as "--" (unknown); a complete object renders its values (dimmed/"?" when `usage_age_s` says stale) |
-| `host` | object\|null | `{cpu_percent, load_percent, ram_used_percent, ram_total_mb}` — same **all-or-nothing rule (S3)**: complete and numeric, or null (board renders "--"); null when unavailable |
+| `tokens_24h`, `tokens_7d` | object\|null | **REQUIRED (all-or-nothing, S3/S4a)**: `total, input, output, cache, est_cost, api_calls, sessions` — if ANY required field is absent, null, mistyped, or non-finite (NaN/Infinity), the whole object is null, never partial, never zero-filled. `reasoning` is **pass-through**: emitted when present and numeric, null otherwise, and may never veto the object. The board renders null as "--" (unknown); a complete object renders its values (dimmed/"?" when `usage_age_s` says stale) |
+| `host` | object\|null | **REQUIRED: `cpu_percent`, `ram_used_percent`** (the two the firmware reads) — same all-or-nothing rule; `load_percent` and `ram_total_mb` are pass-through (null when absent/bad, never veto). Board renders null as "--" |
 | `usage_age_s` | int\|null | **age of the usage DATA**: seconds since the producer's `generated_at` (falling back to the relay's fetch time only when `generated_at` is absent or implausible), clamped ≥ 0. Arbitrarily OLD data reports its true large age — this producer-side age is the board's only staleness signal, however long the usage service has been serving last-good data |
 | `generated_at` | int\|null | epoch seconds, forwarded from the usage snapshot |
 | `schema` | int | contract version — currently `2` |
 
 Null semantics: any unavailable value is JSON `null` — the firmware renders
 nulls as "--"/unknown. Period objects (`tokens_24h`, `tokens_7d`) and `host`
-are additionally **all-or-nothing (S3)**: if any required field is absent,
-null, or not a real number, the entire object is null — the relay never
-emits a partial or zero-filled object, because the board would render a
-null inside a present object as a measured 0 ("0", "CPU 0%"). A zeroed or
-fabricated value would be a fact the relay invented; "--" is honest.
+are **all-or-nothing over their REQUIRED set** (S3/S4a): the required
+fields are exactly the ones the firmware renders — for periods `total,
+input, output, cache, est_cost, api_calls, sessions`; for host
+`cpu_percent, ram_used_percent`. If any REQUIRED field is absent, null,
+mistyped, or non-finite (NaN/Infinity), the entire object is null — the
+relay never emits a partial or zero-filled object, because the board would
+render a null inside a present object as a measured 0 ("0", "CPU 0%").
+Non-required fields (`reasoning`, `load_percent`, `ram_total_mb`) are
+pass-through: emitted when present and numeric, null otherwise — an unused
+field may never black out a used one. If a future firmware reads a
+pass-through field, it joins the required set and the schema bumps.
+A zeroed or fabricated value would be a fact the relay invented; "--" is honest.
 
 Host fields: `cpu_percent` is a real sampled CPU utilisation (null when no
 sample is obtainable). `load_percent` is the 1-minute load average ÷ core

@@ -24,10 +24,16 @@ single board this is accepted; it is not a general DoS defence.
 Contract (schema 2) — see the CONTRACT section in ../README.md:
   - Only the keys the board parses are emitted; nothing passes through.
   - Unavailable usage data is JSON null, never omitted, never zeroed
-    (tokens_24h / tokens_7d / host). Period and host objects are
-    ALL-OR-NOTHING (S3): if any required field is absent, null, or not
-    a real number (strings/booleans rejected), the whole object is
-    null — a partial object would render on the board as measured 0.
+    (tokens_24h / tokens_7d / host). These objects are ALL-OR-NOTHING
+    over their REQUIRED set (S3/S4a) — the fields the firmware renders:
+    periods require total/input/output/cache/est_cost/api_calls/sessions,
+    host requires cpu_percent/ram_used_percent. Any REQUIRED field
+    absent, null, mistyped, or non-finite (NaN/Infinity) ⇒ the whole
+    object is null (the board would render a null inside a present
+    object as a measured 0). Non-required fields (reasoning,
+    load_percent, ram_total_mb) are pass-through: present-and-numeric or
+    null, and may never veto the object. If a future firmware reads a
+    pass-through field, it joins REQUIRED and the schema bumps.
   - usage_age_s  int|null  age of the usage DATA: seconds since the
     producer's generated_at, clamped >= 0. Arbitrarily OLD timestamps
     are accepted and reported truthfully (a large age is real
@@ -55,6 +61,7 @@ import argparse
 import http.client
 import http.server
 import json
+import math
 import socket
 import sys
 import threading
@@ -88,11 +95,22 @@ STATUS_ALLOWLIST = (
     "gateway_platforms", "disk", "profiles", "can_update_hermes",
     "nous_session_valid", "components",
 )
-# Fields of each tokens_* object the board reads (input/output added for 7d
-# in schema 2 — keep every field the board needs).
-TOKEN_FIELDS = ("total", "input", "output", "cache", "reasoning",
-                "api_calls", "sessions", "est_cost")
-HOST_FIELDS = ("cpu_percent", "load_percent", "ram_used_percent", "ram_total_mb")
+# Fields of each tokens_* object. REQUIRED = the seven the firmware
+# renders (S4a): any of these absent/null/mistyped/non-finite ⇒ the whole
+# object is null. PASS-THROUGH fields are still type-checked but may never
+# veto the object: emitted when present and numeric, null otherwise.
+# If a future firmware reads a pass-through field, it joins REQUIRED and
+# the schema bumps.
+TOKEN_REQUIRED = ("total", "input", "output", "cache",
+                  "est_cost", "api_calls", "sessions")
+TOKEN_PASS_THROUGH = ("reasoning",)
+TOKEN_FIELDS = TOKEN_REQUIRED + TOKEN_PASS_THROUGH
+
+# host: the firmware reads cpu_percent and ram_used_percent (S4a) — those
+# two are REQUIRED; load_percent and ram_total_mb pass through.
+HOST_REQUIRED = ("cpu_percent", "ram_used_percent")
+HOST_PASS_THROUGH = ("load_percent", "ram_total_mb")
+HOST_FIELDS = HOST_REQUIRED + HOST_PASS_THROUGH
 
 
 class UpstreamError(Exception):
@@ -211,24 +229,35 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
     return result["body"]
 
 
-def _pick(obj, fields):
-    """All-or-nothing allowlist of a flat dict (S3).
+def _numeric(v):
+    """Real, finite number — booleans, strings, NaN and Infinity are not."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    return math.isfinite(v)
 
-    If ANY required field is absent, JSON null, or not a real number
-    (booleans and strings rejected — the board would render them as a
-    measured 0 because per-field defaults apply once the object is
-    present), the WHOLE object is emitted as None: a period/host object
-    is either complete and numeric, or null. The board renders null as
-    "--" (unknown), which is the correct rendering for partial data.
+
+def _pick(obj, required, pass_through=()):
+    """Allowlist a flat dict with REQUIRED and PASS-THROUGH fields (S3/S4a).
+
+    REQUIRED (the fields the board actually renders): if ANY is absent,
+    JSON null, mistyped, or non-finite, the WHOLE object is None — never
+    partial, never zero-filled (the board renders a null inside a present
+    object as a measured 0, so partial data must become unknown "--").
+    PASS-THROUGH: emitted with their value when present and numeric,
+    null otherwise — they may never veto the object (S4a: unused fields
+    must not black out used ones).
     """
     if not isinstance(obj, dict):
         return None
     picked = {}
-    for f in fields:
+    for f in required:
         v = obj.get(f)
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            return None  # absent, null, or mistyped → all-or-nothing null
+        if not _numeric(v):
+            return None  # required field bad → all-or-nothing null
         picked[f] = v
+    for f in pass_through:
+        v = obj.get(f)
+        picked[f] = v if _numeric(v) else None
     return picked
 
 
@@ -293,11 +322,14 @@ def build_payload(status: dict, refresher: UsageRefresher, now=None) -> dict:
     usage, taken_at = refresher.snapshot() if refresher else (None, None)
     ga = usage.get("generated_at") if isinstance(usage, dict) else None
     ga = _sanitize_generated_at(ga, now)
-    payload["tokens_24h"] = _pick(usage.get("h24"), TOKEN_FIELDS) \
+    payload["tokens_24h"] = _pick(usage.get("h24"), TOKEN_REQUIRED,
+                                  TOKEN_PASS_THROUGH) \
         if isinstance(usage, dict) else None
-    payload["tokens_7d"] = _pick(usage.get("d7"), TOKEN_FIELDS) \
+    payload["tokens_7d"] = _pick(usage.get("d7"), TOKEN_REQUIRED,
+                                 TOKEN_PASS_THROUGH) \
         if isinstance(usage, dict) else None
-    payload["host"] = _pick(usage.get("host"), HOST_FIELDS) \
+    payload["host"] = _pick(usage.get("host"), HOST_REQUIRED,
+                            HOST_PASS_THROUGH) \
         if isinstance(usage, dict) else None
     # usage_age_s measures the age of the DATA, not of the relay's fetch:
     # prefer the producer's generated_at — usage-server serves its last-good

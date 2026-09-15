@@ -172,7 +172,16 @@ class TestAllowlist(RelayTestCase):
         self.assertEqual(set(data), expected)
 
     def test_nested_usage_fields_allowlisted(self):
-        _, data = self.get()
+        # S4c: bounded poll — the background refresher's FIRST fetch may
+        # not have landed yet under load; a bare get() raced it and
+        # tokens_24h was legitimately still null.
+        deadline = time.monotonic() + 3.0
+        data = None
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["tokens_24h"] is not None:
+                break
+            time.sleep(0.05)
         self.assertEqual(
             set(data["tokens_24h"]),
             {"total", "input", "output", "cache", "reasoning",
@@ -288,13 +297,36 @@ class TestNonBlocking(RelayTestCase):
         # S2: when the join deadline expires, the fetch socket is
         # force-closed so the abandoned worker exits promptly — repeated
         # over-budget polls must not accumulate worker threads.
+        # S4c: bounded poll (not a fixed sleep) scoped to workers that
+        # exist after the FIRST response — a neighbour test's worker
+        # winding down, or a load-slowed drain, must not flake this.
+        # The assertion stays strict: zero workers at the end.
         self.handler.status_delay = 30.0   # upstream never answers in time
 
         def workers():
-            return [t for t in threading.enumerate()
-                    if t.name == "relay-upstream-fetch"]
+            return {t.ident for t in threading.enumerate()
+                    if t.name == "relay-upstream-fetch"}
 
-        for _ in range(5):
+        def poll_no_workers(baseline, budget_s=3.0):
+            deadline = time.monotonic() + budget_s
+            while time.monotonic() < deadline:
+                if not (workers() - baseline):
+                    return True
+                time.sleep(0.05)
+            return not (workers() - baseline)
+
+        # first response also establishes the pre-existing-worker baseline
+        t0 = time.monotonic()
+        try:
+            urllib.request.urlopen(self.url, timeout=30)
+            self.fail("expected 502")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 502)
+            e.read()
+        self.assertLess(time.monotonic() - t0, relay.STATUS_TIMEOUT + 1.0)
+
+        baseline = workers()   # may transiently hold this test's 1st worker
+        for _ in range(4):
             t0 = time.monotonic()
             try:
                 urllib.request.urlopen(self.url, timeout=30)
@@ -304,9 +336,11 @@ class TestNonBlocking(RelayTestCase):
                 e.read()
             self.assertLess(time.monotonic() - t0,
                             relay.STATUS_TIMEOUT + 1.0)
-        time.sleep(0.5)  # let the abandoned workers observe the closed socket
-        self.assertEqual(len(workers()), 0,
-                         "abandoned fetch workers are lingering (S2)")
+            self.assertTrue(poll_no_workers(baseline),
+                            "abandoned fetch workers are lingering (S2)")
+        # strict final check, still scoped to this test's workers
+        self.assertTrue(poll_no_workers(baseline),
+                        "abandoned fetch workers are lingering (S2)")
         self.handler.status_delay = 0.0
 
     def test_stalled_usage_does_not_block_response(self):
@@ -408,16 +442,21 @@ class TestUsageAge(RelayTestCase):
         self.assertLess(data["usage_age_s"], 3700)
 
     def test_age_falls_back_to_fetch_time_without_generated_at(self):
-        # producer omits generated_at → fall back to relay fetch time
+        # producer omits generated_at → fall back to relay fetch time.
+        # S4c: wait on a DISTINCTIVE value — SAMPLE_USAGE's generated_at
+        # is itself None, so waiting on generated_at is None would break
+        # before this test's body ever landed.
         no_ga = dict(SAMPLE_USAGE)
         del no_ga["generated_at"]
+        no_ga["h24"] = dict(no_ga["h24"], total=424242)   # marker
         self.handler.usage_body = json.dumps(no_ga).encode()
         self.cfg.refresher.interval = 0.05
         deadline = time.monotonic() + 5
         _, data = None, None
         while time.monotonic() < deadline:
             _, data = self.get()
-            if data["generated_at"] is None:
+            tk = data["tokens_24h"]
+            if tk is not None and tk.get("total") == 424242:
                 break
             time.sleep(0.05)
         self.assertIsNone(data["generated_at"])
@@ -446,12 +485,16 @@ class TestUsageAge(RelayTestCase):
         for ga in (-5000, 0, int(time.time()) + 48 * 3600):
             stale = dict(SAMPLE_USAGE)
             stale["generated_at"] = ga
+            stale["h24"] = dict(stale["h24"], total=434343)  # S4c marker:
+            # SAMPLE_USAGE's generated_at is None, so waiting on
+            # generated_at is None alone would break on the OLD body.
             self.handler.usage_body = json.dumps(stale).encode()
             self.cfg.refresher.interval = 0.05
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 _, data = self.get()
-                if data["generated_at"] is None:
+                tk = data["tokens_24h"]
+                if tk is not None and tk.get("total") == 434343:
                     break
                 time.sleep(0.05)
             self.assertIsNone(data["generated_at"])
@@ -547,7 +590,10 @@ class TestConcurrency(RelayTestCase):
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         url = f"http://127.0.0.1:{httpd.server_port}/api/status"
         try:
-            self.handler.status_delay = 1.0
+            # 2.0 s upstream delay (S4c robustness: a 1.0 s window flaked
+            # under load when the second thread arrived late and both
+            # requests legitimately succeeded)
+            self.handler.status_delay = 2.0
             # Fire two requests CONCURRENTLY: both hit the slow upstream
             # while the single slot is held by the first.
             results = []
@@ -640,8 +686,11 @@ class TestAllOrNothing(RelayTestCase):
                           "one null field must null the whole host object")
 
     def test_host_mistyped_field_nulls_whole_object(self):
-        for field, bad in (("ram_total_mb", "32768"),
-                           ("load_percent", False)):
+        # S4a: only REQUIRED fields (cpu_percent, ram_used_percent) veto
+        # the object; bad pass-through values are nulled, not fatal
+        # (covered in TestRequiredVsPassThrough).
+        for field, bad in (("cpu_percent", "12"),
+                           ("ram_used_percent", False)):
             u = dict(SAMPLE_USAGE)
             u["generated_at"] = int(time.time()) - 2
             u["host"] = {"cpu_percent": 12, "load_percent": 34,
@@ -649,7 +698,7 @@ class TestAllOrNothing(RelayTestCase):
             u["host"][field] = bad
             data = self._get_with_usage(u)
             self.assertIsNone(data["host"],
-                               f"mistyped {field}={bad!r} must null host")
+                               f"mistyped REQUIRED {field}={bad!r} must null host")
 
     def test_host_complete_numeric_emitted_intact(self):
         u = dict(SAMPLE_USAGE)
@@ -660,6 +709,101 @@ class TestAllOrNothing(RelayTestCase):
         data = self._get_with_usage(u)
         self.assertEqual(data["host"], complete)
         self.assertEqual(set(data["host"]), set(relay.HOST_FIELDS))
+
+
+class TestRequiredVsPassThrough(RelayTestCase):
+    """S4a: only fields the board actually reads are REQUIRED; the rest
+    pass through (null when bad) and may never veto the object. S4b:
+    NaN/Infinity are invalid values everywhere."""
+
+    def _get_with_usage(self, usage):
+        self.handler.usage_body = json.dumps(usage).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        data = None
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == usage.get("generated_at"):
+                break
+            time.sleep(0.05)
+        return data
+
+    GOOD_T = {"total": 36, "input": 10, "output": 20, "cache": 5,
+              "reasoning": 1, "api_calls": 3, "sessions": 2, "est_cost": 0.42}
+    GOOD_H = {"cpu_percent": 12, "load_percent": 34,
+              "ram_used_percent": 61, "ram_total_mb": 32768}
+
+    def _usage(self, **over):
+        u = dict(SAMPLE_USAGE)
+        u["generated_at"] = int(time.time()) - 2
+        for k, v in over.items():
+            u[k] = v
+        return u
+
+    def test_host_missing_load_percent_still_intact(self):
+        # S4a blackout regression: a producer shipping cpu/ram but not
+        # load_percent must NOT null the board's whole CPU/RAM display.
+        h = {"cpu_percent": 12, "ram_used_percent": 61}
+        data = self._get_with_usage(self._usage(host=h))
+        self.assertIsNotNone(data["host"])
+        self.assertEqual(data["host"]["cpu_percent"], 12)
+        self.assertEqual(data["host"]["ram_used_percent"], 61)
+        self.assertIsNone(data["host"]["load_percent"])   # pass-through
+        self.assertIsNone(data["host"]["ram_total_mb"])   # pass-through
+
+    def test_host_missing_ram_used_percent_nulls_object(self):
+        h = dict(self.GOOD_H)
+        del h["ram_used_percent"]
+        data = self._get_with_usage(self._usage(host=h))
+        self.assertIsNone(data["host"])
+
+    def test_period_missing_reasoning_still_intact(self):
+        d = dict(self.GOOD_T)
+        del d["reasoning"]
+        data = self._get_with_usage(self._usage(h24=d))
+        self.assertIsNotNone(data["tokens_24h"])
+        self.assertEqual(data["tokens_24h"]["total"], 36)
+        self.assertIsNone(data["tokens_24h"]["reasoning"])
+
+    def test_period_missing_input_nulls_object(self):
+        d = dict(self.GOOD_T)
+        del d["input"]
+        data = self._get_with_usage(self._usage(h24=d))
+        self.assertIsNone(data["tokens_24h"])
+
+    def test_pass_through_bad_type_nulled_not_fatal(self):
+        h = dict(self.GOOD_H)
+        h["ram_total_mb"] = "32768"      # string where a number belongs
+        d = dict(self.GOOD_T)
+        d["reasoning"] = True            # bool
+        data = self._get_with_usage(self._usage(h24=d, host=h))
+        self.assertIsNotNone(data["host"])
+        self.assertIsNone(data["host"]["ram_total_mb"])
+        self.assertIsNotNone(data["tokens_24h"])
+        self.assertIsNone(data["tokens_24h"]["reasoning"])
+
+    def test_nan_and_infinity_rejected(self):
+        # S4b: json.loads accepts NaN/Infinity; the relay must not emit
+        # them (bare NaN is invalid JSON for the board). Raw literals are
+        # injected via the handler body — json.dumps would not produce
+        # them. NaN in a REQUIRED field (total) → whole period null;
+        # Infinity in a REQUIRED field (cpu_percent) → whole host null.
+        ga = int(time.time()) - 2
+        self.handler.usage_body = (
+            "{"
+            '"h24": {"total": NaN, "input": 1, "output": 2, "cache": 3, '
+            '"api_calls": 4, "sessions": 5, "est_cost": 0.1}, '
+            '"host": {"cpu_percent": Infinity, "ram_used_percent": 50}, '
+            '"generated_at": %d}' % ga).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == ga:
+                break
+            time.sleep(0.05)
+        self.assertIsNone(data["tokens_24h"])
+        self.assertIsNone(data["host"])
 
 
 if __name__ == "__main__":
