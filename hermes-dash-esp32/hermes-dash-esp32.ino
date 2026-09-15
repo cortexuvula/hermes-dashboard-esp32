@@ -112,11 +112,11 @@ LGFX tft;
 // TOKENS page
 #define TK_HEAD_Y             24     // Font0 (was Font2@18 — exceeded R=80)
 #define TK_QUAL_Y             34     // Font0
-#define TK_BIG_Y              62     // DejaVu40 (moved to fit R=80)
+#define TK_BIG_Y              66     // DejaVu40 (moved down 4px for stale "?" suffix)
 #define TK_BIG_W              150    // 6 chars DejaVu40 worst case
-#define TK_DET1_Y             84     // Font0 for 24H IN/OUT (was Font2 — too wide for R=80)
-#define TK_DET2_Y             108    // Font0 (was 110)
-#define TK_DET3_Y             126    // Font0 (was 130 — exceeded R=80)
+#define TK_DET1_Y             88     // Font0 for 24H IN/OUT (was Font2 — too wide for R=80)
+#define TK_DET2_Y             112    // Font0 (was 110)
+#define TK_DET3_Y             126    // Font0 (moved from 130 — calls worst-case r=79.3 at R=80)
 
 // HEALTH page
 #define HL_HEAD_Y             26
@@ -130,21 +130,6 @@ LGFX tft;
 #define HL_ERR_Y              92
 #define HL_AUTH_Y             134    // was 136 (moved up for host line)
 #define HL_HOST_Y             140    // was 150 — exceeded R=80 (moved up)
-
-// Worst-case string widths (for checker; font_w * char_count)
-// Font0 = 5px/char, Font2 = 8px/char, DejaVu40 ≈ 25px/char
-#define WC_FOOTER_W           85     // "v0.21.3  99 bots" 17ch F0
-#define WC_DISK_W             40     // "DISK 99%" 8ch F0
-#define WC_HEAD_W             50     // "TOKENS 24H" 10ch F0
-#define WC_QUAL_W             85     // "NEW SESSIONS ONLY" 17ch F0
-#define WC_IO24_W             128    // "IN 1234M  OUT 1234M" 16ch F2
-#define WC_IO7_W              105    // "IN 1234M  OUT 1234M?" 21ch F0
-#define WC_CACHE_W            65     // "CACHE --  $--" 13ch F0
-#define WC_CALLS_W            110    // "CALLS 1234M  SES 12345" 22ch F0
-#define WC_COST_W             48     // "$99.99" 6ch F2
-#define WC_AUTH_W             96     // "AUTH EXPIRED" 12ch F2
-#define WC_HOST_W             90     // "CPU 100%  RAM 100%" 18ch F0
-#define WC_OVERFLOW_W         15     // "+99" 3ch F0
 
 // ── Colors (RGB565) ───────────────────────────────────
 #define C_BG        0x0000  // black
@@ -214,9 +199,11 @@ const unsigned long FETCH_INTERVAL = 10000; // 10s poll
 
 bool fetch_ok = false;
 int  active_sessions = 0;
-int  active_agents   = 0;
+bool active_sessions_known = false;
 bool gateway_busy    = false;
+bool gateway_busy_known = false;
 bool gateway_degraded = false;
+bool overall_known = false;
 
 // A10: per-platform state replaces attention_idx[] and platforms_up
 PlatformState g_platforms[MAX_PLATFORMS];
@@ -224,8 +211,10 @@ int g_platforms_rendered = 0;  // how many dots to draw (0–8)
 int g_platforms_total    = 0;  // actual total from JSON (for overflow marker)
 
 int    disk_pct = 0;
+bool   disk_known = false;
 String version_str = "";
 String profile_count = "";
+bool   profile_known = false;
 bool   can_update = false;
 
 // A6 tri-state session validity (was boolean)
@@ -257,6 +246,7 @@ PeriodUsage usage_7d;
 
 // A6: staleness from usage_age_s (board has no clock/NTP)
 int  g_usage_age_s = -1;  // -1 = unknown; >60 = stale
+bool g_age_known = false;  // false = age unknown → treat as stale
 int  g_schema      = 0;   // contract version; 0 = not seen
 
 const unsigned long PAGE_MS = 12000; // rotate pages every 12s
@@ -266,7 +256,8 @@ const int PAGE_COUNT = 4;            // STATUS / TOKENS 24H / TOKENS 7D / HEALTH
 const int MAX_RESPONSE_SIZE = 32768;
 
 // ── Helpers ───────────────────────────────────────────
-static inline bool is_stale() { return g_usage_age_s > 60; }
+// A6: age unknown → treat as stale (never present unknown as fresh)
+static inline bool is_stale() { return !g_age_known || g_usage_age_s > 60; }
 
 // Token formatting (e.g. 79599877 → "79.6M")
 String fmt_tokens(long long v) {
@@ -288,7 +279,8 @@ bool fetch_dashboard() {
         return false;
     }
 
-    // A9: reject oversized responses (protect ~300KB heap on no-PSRAM C6)
+    // A9 + #4: reject oversized responses (protect ~300KB heap on no-PSRAM C6)
+    // Fast-path when Content-Length is known; bounded stream read when unknown.
     int resp_size = http.getSize();
     if (resp_size > MAX_RESPONSE_SIZE) {
         Serial.printf("[dash] response too large: %d bytes (max %d) — rejected\n", resp_size, MAX_RESPONSE_SIZE);
@@ -296,7 +288,33 @@ bool fetch_dashboard() {
         return false;
     }
 
-    String payload = http.getString();
+    String payload;
+    if (resp_size > 0) {
+        // Known length: read in one shot (safe — already size-checked above)
+        payload = http.getString();
+    } else {
+        // #4: Unknown length (chunked): bounded stream read, abort on overflow
+        WiFiClient* stream = http.getStreamPtr();
+        payload.reserve(4096);
+        unsigned long t0 = millis();
+        while (stream->connected() && (millis() - t0 < 8000)) {
+            size_t avail = stream->available();
+            if (avail) {
+                char buf[512];
+                size_t to_read = (avail < sizeof(buf)) ? avail : sizeof(buf);
+                size_t got = stream->readBytes(buf, to_read);
+                if (payload.length() + got > (unsigned)MAX_RESPONSE_SIZE) {
+                    Serial.printf("[dash] chunked response exceeded %d bytes — aborted\n", MAX_RESPONSE_SIZE);
+                    http.end();
+                    return false;
+                }
+                payload.concat(buf, got);
+            } else {
+                delay(1);
+                if (!stream->available() && !stream->connected()) break;
+            }
+        }
+    }
     http.end();
 
     if ((int)payload.length() > MAX_RESPONSE_SIZE) {
@@ -308,7 +326,6 @@ bool fetch_dashboard() {
     // This avoids a full duplicate document on a no-PSRAM device.
     JsonDocument filter;
     filter["active_sessions"]      = true;
-    filter["active_agents"]        = true;
     filter["gateway_busy"]         = true;
     filter["version"]              = true;
     filter["overall"]              = true;
@@ -323,6 +340,7 @@ bool fetch_dashboard() {
     filter["host"]                 = true;
     filter["usage_age_s"]          = true;
     filter["schema"]               = true;
+    // #7: active_agents removed (dead code — fetched but never rendered)
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
@@ -332,24 +350,44 @@ bool fetch_dashboard() {
         return false;
     }
 
-    // --- Core fields ---
-    active_sessions   = doc["active_sessions"] | 0;
-    active_agents     = doc["active_agents"]   | 0;
-    gateway_busy      = doc["gateway_busy"]    | false;
-    version_str       = doc["version"]         | "?";
-    const char* overall = doc["overall"];
-    gateway_degraded  = (overall && strcmp(overall, "degraded") == 0);
+    // --- Core fields (#2: track presence, absent = unknown) ---
+    if (doc["active_sessions"].is<int>()) {
+        active_sessions = doc["active_sessions"].as<int>();
+        active_sessions_known = true;
+    } else {
+        active_sessions_known = false;
+    }
+    
+    if (doc["gateway_busy"].is<bool>()) {
+        gateway_busy = doc["gateway_busy"].as<bool>();
+        gateway_busy_known = true;
+    } else {
+        gateway_busy_known = false;
+    }
+    
+    version_str = doc["version"] | "?";
+    
+    if (doc["overall"].is<const char*>()) {
+        const char* overall = doc["overall"].as<const char*>();
+        gateway_degraded = (overall && strcmp(overall, "degraded") == 0);
+        overall_known = true;
+    } else {
+        gateway_degraded = false;
+        overall_known = false;
+    }
 
     // A6: schema version (log at boot, tolerate unknown)
     if (doc["schema"].is<int>()) {
         g_schema = doc["schema"].as<int>();
     }
 
-    // A6: staleness — usage_age_s (null = unknown)
+    // A6: staleness — usage_age_s (null = unknown → treat as stale)
     if (doc["usage_age_s"].is<int>()) {
         g_usage_age_s = doc["usage_age_s"].as<int>();
+        g_age_known = true;
     } else {
         g_usage_age_s = -1;
+        g_age_known = false;
     }
 
     // --- A10: Platforms — per-platform state, max 8 rendered ---
@@ -368,13 +406,23 @@ bool fetch_dashboard() {
         // entries beyond MAX_PLATFORMS are counted for overflow marker only
     }
 
-    // Disk
+    // Disk (#2: track presence)
     JsonObject disk = doc["disk"];
-    disk_pct = (int)(disk["used_percent"] | 0.0);
+    if (!disk.isNull() && disk["used_percent"].is<double>()) {
+        disk_pct = (int)disk["used_percent"].as<double>();
+        disk_known = true;
+    } else {
+        disk_known = false;
+    }
 
-    // Profiles
+    // Profiles (#2: track presence)
     JsonArray profiles = doc["profiles"].as<JsonArray>();
-    profile_count = String(profiles.size());
+    if (!profiles.isNull()) {
+        profile_count = String(profiles.size());
+        profile_known = true;
+    } else {
+        profile_known = false;
+    }
 
     // Update availability
     can_update = doc["can_update_hermes"] | false;
@@ -389,28 +437,51 @@ bool fetch_dashboard() {
     }
 
     // A6: components — null = UNKNOWN (not silently healthy)
+    // #6: also check inner status fields (absent = UNKNOWN, not DOWN)
     JsonObject comp = doc["components"];
     if (comp.isNull() || !doc.containsKey("components")) {
         comp_gw = comp_dash = comp_storage = comp_platforms = COMP_UNKNOWN;
         dash_errors = 0;
     } else {
-        comp_gw        = (strcmp(comp["gateway"]["status"]   | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
-        comp_dash      = (strcmp(comp["dashboard"]["status"] | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
-        dash_errors    = comp["dashboard"]["recent_unhandled_errors"] | 0;
-        comp_storage   = (strcmp(comp["storage"]["status"]   | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
-        comp_platforms = (strcmp(comp["platforms"]["status"] | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
+        // Gateway
+        if (comp["gateway"].is<JsonObject>() && comp["gateway"]["status"].is<const char*>()) {
+            comp_gw = (strcmp(comp["gateway"]["status"].as<const char*>(), "ok") == 0) ? COMP_OK : COMP_DOWN;
+        } else {
+            comp_gw = COMP_UNKNOWN;
+        }
+        // Dashboard
+        if (comp["dashboard"].is<JsonObject>() && comp["dashboard"]["status"].is<const char*>()) {
+            comp_dash = (strcmp(comp["dashboard"]["status"].as<const char*>(), "ok") == 0) ? COMP_OK : COMP_DOWN;
+            dash_errors = comp["dashboard"]["recent_unhandled_errors"] | 0;
+        } else {
+            comp_dash = COMP_UNKNOWN;
+            dash_errors = 0;
+        }
+        // Storage
+        if (comp["storage"].is<JsonObject>() && comp["storage"]["status"].is<const char*>()) {
+            comp_storage = (strcmp(comp["storage"]["status"].as<const char*>(), "ok") == 0) ? COMP_OK : COMP_DOWN;
+        } else {
+            comp_storage = COMP_UNKNOWN;
+        }
+        // Platforms
+        if (comp["platforms"].is<JsonObject>() && comp["platforms"]["status"].is<const char*>()) {
+            comp_platforms = (strcmp(comp["platforms"]["status"].as<const char*>(), "ok") == 0) ? COMP_OK : COMP_DOWN;
+        } else {
+            comp_platforms = COMP_UNKNOWN;
+        }
     }
 
     // A7: token usage — one struct per period, null = absent
+    // #6: also check inner fields (null = absent, not zero)
     JsonObject tk24 = doc["tokens_24h"];
     if (!tk24.isNull() && doc.containsKey("tokens_24h")) {
-        usage_24h.total    = tk24["total"]    | 0LL;
-        usage_24h.input    = tk24["input"]    | 0LL;
-        usage_24h.output   = tk24["output"]   | 0LL;
-        usage_24h.cache    = tk24["cache"]    | 0LL;
-        usage_24h.cost     = tk24["est_cost"] | 0.0;
-        usage_24h.calls    = tk24["api_calls"]| 0LL;
-        usage_24h.sessions = tk24["sessions"] | 0LL;
+        usage_24h.total    = tk24["total"].is<long long>() ? tk24["total"].as<long long>() : 0LL;
+        usage_24h.input    = tk24["input"].is<long long>() ? tk24["input"].as<long long>() : 0LL;
+        usage_24h.output   = tk24["output"].is<long long>() ? tk24["output"].as<long long>() : 0LL;
+        usage_24h.cache    = tk24["cache"].is<long long>() ? tk24["cache"].as<long long>() : 0LL;
+        usage_24h.cost     = tk24["est_cost"].is<double>() ? tk24["est_cost"].as<double>() : 0.0;
+        usage_24h.calls    = tk24["api_calls"].is<long long>() ? tk24["api_calls"].as<long long>() : 0LL;
+        usage_24h.sessions = tk24["sessions"].is<long long>() ? tk24["sessions"].as<long long>() : 0LL;
         usage_24h.valid    = true;
     } else {
         usage_24h = PeriodUsage();  // reset — valid=false → show "--"
@@ -419,24 +490,29 @@ bool fetch_dashboard() {
     // A7 fix: 7d now reads ALL fields including input/output (was missing)
     JsonObject tk7 = doc["tokens_7d"];
     if (!tk7.isNull() && doc.containsKey("tokens_7d")) {
-        usage_7d.total    = tk7["total"]    | 0LL;
-        usage_7d.input    = tk7["input"]    | 0LL;
-        usage_7d.output   = tk7["output"]   | 0LL;
-        usage_7d.cache    = tk7["cache"]    | 0LL;
-        usage_7d.cost     = tk7["est_cost"] | 0.0;
-        usage_7d.calls    = tk7["api_calls"]| 0LL;
-        usage_7d.sessions = tk7["sessions"] | 0LL;
+        usage_7d.total    = tk7["total"].is<long long>() ? tk7["total"].as<long long>() : 0LL;
+        usage_7d.input    = tk7["input"].is<long long>() ? tk7["input"].as<long long>() : 0LL;
+        usage_7d.output   = tk7["output"].is<long long>() ? tk7["output"].as<long long>() : 0LL;
+        usage_7d.cache    = tk7["cache"].is<long long>() ? tk7["cache"].as<long long>() : 0LL;
+        usage_7d.cost     = tk7["est_cost"].is<double>() ? tk7["est_cost"].as<double>() : 0.0;
+        usage_7d.calls    = tk7["api_calls"].is<long long>() ? tk7["api_calls"].as<long long>() : 0LL;
+        usage_7d.sessions = tk7["sessions"].is<long long>() ? tk7["sessions"].as<long long>() : 0LL;
         usage_7d.valid    = true;
     } else {
         usage_7d = PeriodUsage();
     }
 
     // A6: host — null/absent = UNKNOWN (not silently carried over)
+    // #6: also check inner fields
     JsonObject host = doc["host"];
     if (!host.isNull() && doc.containsKey("host")) {
-        host_cpu = host["cpu_percent"]     | 0;
-        host_ram = host["ram_used_percent"]| 0;
-        g_host_known = true;
+        if (host["cpu_percent"].is<int>()) {
+            host_cpu = host["cpu_percent"].as<int>();
+        }
+        if (host["ram_used_percent"].is<int>()) {
+            host_ram = host["ram_used_percent"].as<int>();
+        }
+        g_host_known = host["cpu_percent"].is<int>() && host["ram_used_percent"].is<int>();
     } else {
         g_host_known = false;
         // values retained but g_host_known=false → render as "--"
@@ -494,23 +570,36 @@ void draw_platform_ring() {
 }
 
 // ── Render: big center number ─────────────────────────
-void draw_center(int sessions) {
+// #2: absent sessions renders "--", not 0
+void draw_center() {
     tft.setTextColor(C_TEXT, C_BG);
     tft.setTextDatum(MC_DATUM);
     tft.setFont(&fonts::DejaVu40);
-    tft.drawNumber(sessions, CENTER_X, STATUS_NUM_Y);
+    if (active_sessions_known) {
+        tft.drawNumber(active_sessions, CENTER_X, STATUS_NUM_Y);
+    } else {
+        tft.drawString("--", CENTER_X, STATUS_NUM_Y);
+    }
     tft.setFont(&fonts::Font2);
-    tft.drawString(sessions == 1 ? "SESSION" : "SESSIONS", CENTER_X, STATUS_SESS_Y);
+    if (active_sessions_known) {
+        tft.drawString(active_sessions == 1 ? "SESSION" : "SESSIONS", CENTER_X, STATUS_SESS_Y);
+    } else {
+        tft.drawString("", CENTER_X, STATUS_SESS_Y);
+    }
 }
 
 // ── Render: gateway state line ────────────────────────
-void draw_state(bool busy, bool degraded) {
+// #2: absent overall → "UNKNOWN" (dim), never green RUNNING
+void draw_state() {
     tft.setFont(&fonts::Font2);
     tft.setTextDatum(MC_DATUM);
-    if (degraded) {
+    if (!overall_known && !gateway_busy_known) {
+        tft.setTextColor(C_DIM, C_BG);
+        tft.drawString("UNKNOWN", CENTER_X, STATUS_STATE_Y);
+    } else if (gateway_degraded) {
         tft.setTextColor(C_DEGRADED, C_BG);
         tft.drawString("DEGRADED", CENTER_X, STATUS_STATE_Y);
-    } else if (busy) {
+    } else if (gateway_busy && gateway_busy_known) {
         tft.setTextColor(C_YELLOW, C_BG);
         tft.drawString("BUSY", CENTER_X, STATUS_STATE_Y);
     } else {
@@ -520,30 +609,43 @@ void draw_state(bool busy, bool degraded) {
 }
 
 // ── Render: disk bar (A11: moved up inside aperture) ──
-void draw_disk_bar(int pct) {
+// #2: absent disk → grey bar and "DISK --"
+void draw_disk_bar() {
     int bar_w = STATUS_DISK_BAR_W;
     int bar_h = STATUS_DISK_BAR_H;
     int bar_x = CENTER_X - bar_w / 2;
     int bar_y = CENTER_Y + STATUS_DISK_BAR_DY;
 
     tft.drawRect(bar_x, bar_y, bar_w, bar_h, C_DIM);
-    uint16_t bar_color = (pct > 85) ? C_DOWN : (pct > 70) ? C_DEGRADED : C_OK;
-    int fill = (bar_w - 2) * pct / 100;
-    if (fill > 0) tft.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, bar_color);
+    if (disk_known) {
+        uint16_t bar_color = (disk_pct > 85) ? C_DOWN : (disk_pct > 70) ? C_DEGRADED : C_OK;
+        int fill = (bar_w - 2) * disk_pct / 100;
+        if (fill > 0) tft.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, bar_color);
+    }
 
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("DISK " + String(pct) + "%", CENTER_X, bar_y + STATUS_DISK_LBL_DY);
+    if (disk_known) {
+        tft.drawString("DISK " + String(disk_pct) + "%", CENTER_X, bar_y + STATUS_DISK_LBL_DY);
+    } else {
+        tft.drawString("DISK --", CENTER_X, bar_y + STATUS_DISK_LBL_DY);
+    }
 }
 
 // ── Render: footer (A11: moved up, dot at fixed inset) ─
-void draw_footer(const String& ver, const String& pro) {
+// #2: absent profiles → footer without bogus count
+void draw_footer() {
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
     tft.setTextDatum(MC_DATUM);
     int footer_y = CENTER_Y + STATUS_FOOTER_DY;
-    String footer = "v" + ver + "  " + pro + " bots";
+    String footer;
+    if (profile_known) {
+        footer = "v" + version_str + "  " + profile_count + " bots";
+    } else {
+        footer = "v" + version_str;
+    }
     tft.drawString(footer, CENTER_X, footer_y);
 
     if (can_update) {
@@ -569,17 +671,20 @@ void draw_tokens_page(bool is7d) {
     tft.drawString("NEW SESSIONS ONLY", CENTER_X, TK_QUAL_Y);
 
     // Big total (A6: "--" for absent, "0" for real zero)
-    tft.setTextColor(C_TEXT, C_BG);
-    tft.setFont(&fonts::DejaVu40);
-    String total_str;
+    // Stale shown via dim color, not "?" suffix (to fit R=80 at 7 chars DejaVu40)
     if (!u.valid) {
-        total_str = "--";
+        tft.setTextColor(C_DIM, C_BG);
+        tft.setFont(&fonts::DejaVu40);
+        tft.drawString("--", CENTER_X, TK_BIG_Y);
     } else if (is_stale()) {
-        total_str = fmt_tokens(u.total) + "?";  // visible but marked stale
+        tft.setTextColor(C_DIM, C_BG);  // dim = stale
+        tft.setFont(&fonts::DejaVu40);
+        tft.drawString(fmt_tokens(u.total), CENTER_X, TK_BIG_Y);
     } else {
-        total_str = fmt_tokens(u.total);
+        tft.setTextColor(C_TEXT, C_BG);
+        tft.setFont(&fonts::DejaVu40);
+        tft.drawString(fmt_tokens(u.total), CENTER_X, TK_BIG_Y);
     }
-    tft.drawString(total_str, CENTER_X, TK_BIG_Y);
 
     if (is7d) {
         // Cost headline
@@ -701,10 +806,10 @@ void render() {
         case 0: { // STATUS
             tft.fillScreen(C_BG);
             draw_platform_ring();
-            draw_center(active_sessions);
-            draw_state(gateway_busy, gateway_degraded);
-            draw_disk_bar(disk_pct);
-            draw_footer(version_str, profile_count);
+            draw_center();
+            draw_state();
+            draw_disk_bar();
+            draw_footer();
             break;
         }
         case 1: draw_tokens_page(false); break;  // TOKENS 24H
@@ -776,7 +881,13 @@ void loop() {
     bool blink_now_on = (now / 400) % 2 == 0;
     bool blink_changed = (blink_now_on != blink_was_on);
 
-    if (page_changed || (blink_changed && fetch_ok)) {
+    // #5: blink redraw only on STATUS page (ring is the only thing that blinks)
+    bool should_redraw = page_changed;
+    if (!page_changed && blink_changed && fetch_ok && current_page == 0) {
+        should_redraw = true;
+    }
+
+    if (should_redraw) {
         current_page = new_page;
         blink_was_on = blink_now_on;
         if (fetch_ok) render();
@@ -792,7 +903,7 @@ void loop() {
 
         fetch_ok = fetch_dashboard();
         if (fetch_ok) {
-            last_success = now;  // A12: stamp AFTER success, not before
+            last_success = millis();  // #1 A12: stamp AFTER success, not before
             render();
         } else {
             show_error();
