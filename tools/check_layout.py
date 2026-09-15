@@ -19,7 +19,7 @@ THIRD PROPERTY — ELEMENT VS ELEMENT (the aperture test cannot see it):
   reported from the hardware).  So every element also gets a VISUAL box — glyph
   band height (GLYPH_H), not the em box, which would make adjacent lines look
   like collisions — and all same-page pairs are intersected; anything overlapping
-  by more than MIN_OVERLAP_PX fails.  The modelled strings are data-shape aware:
+  by more than MIN_GAP_PX fails.  The modelled strings are data-shape aware:
   the footer is server-driven, so the sketch BOUNDS it and WORST["FOOTER"] models
   exactly that bound.
 
@@ -302,10 +302,10 @@ def check(sk, prefix=False):
         line_no=ln)
     # Update dot
     for ln, f, t in sk.draws:
-        if "fillCircle(CENTER_X + STATUS_DOT_DX" in t and ln not in claimed:
+        if "fillCircle(CENTER_X + STATUS_DOT_DX, footer_y + STATUS_DOT_DY" in t and ln not in claimed:
             claimed[ln] = "update dot"
             break
-    add("update dot", circle_r(cx + sk.val("STATUS_DOT_DX"), foot_y, sk.val("STATUS_DOT_R"), cx, cy))
+    add("update dot", circle_r(cx + sk.val("STATUS_DOT_DX"), foot_y + sk.val("STATUS_DOT_DY"), sk.val("STATUS_DOT_R"), cx, cy))
 
     # ── TOKEN pages (both share the TK_* y positions) ───────────────────────
     f, ln = font_check("tk heading", "TK_HEAD_Y", "Font0")
@@ -413,16 +413,22 @@ def check(sk, prefix=False):
     return res, cx, cy, limit, claimed
 
 
-# Visual glyph bands (NOT the em box). The aperture check above deliberately uses the
-# full em height (conservative, keeps glyph corners inside the circle); a collision
-# check must use the height the glyphs actually occupy, or every adjacent line looks
-# like an overlap. Values are the drawn cap/ascender band for each family; Font2 is an
-# 8x16 cell whose glyphs occupy ~12 px, DejaVu40 digits ~28 px.
-GLYPH_H = {"Font0": 7, "Font2": 13, "DejaVu24": 19, "DejaVu40": 29}
+# Visual glyph bands. Calibrated against PHOTOGRAPHS of the panel (this model was wrong
+# twice before that): MC_DATUM centres the full font CELL, and the built-in bitmap fonts
+# fill it, so Font0 = 8 px and Font2 = 16 px — not the 7/13 previously estimated from the
+# em box. Those estimates erred SMALL, which is the direction that hides a real collision.
+# The scalable faces get their drawn cap band (DejaVu40 digits ~29 px), not their line
+# height, which is far larger and would demand impossible spacing.
+GLYPH_H = {"Font0": 8, "Font2": 16, "DejaVu24": 20, "DejaVu40": 29}
 
-# Minimum intersection (px) that counts as a collision. Deliberately below 1.0 so a
-# sub-pixel glyph kiss is reported rather than excluded by a strict > test.
-MIN_OVERLAP_PX = 0.5
+# Minimum SEPARATION (px) between two elements, measured on both axes. Calibrated against
+# hardware photographs of the panel, which showed that (a) MC_DATUM centres the FULL font
+# CELL and these bitmap fonts fill it, so the real bands are Font0 8 / Font2 16 px — not
+# the 7/13 estimated from the em box; and (b) a gap of 0 px (boxes touching exactly) reads
+# as overlapping text on the glass. So the test is "gap >= MIN_GAP", not "overlap > eps":
+# the earlier overlap>0.5 form PASSED a touching pair, which is precisely the defect that
+# shipped twice and was reported from the hardware.
+MIN_GAP_PX = 1.5
 
 # Number of visual boxes the overlap model must produce. The box list is built from the
 # same constants as the aperture check but is a SEPARATE list, so this asserts it cannot
@@ -443,8 +449,12 @@ def overlap_boxes(sk, cx, cy, prefix=False):
         """Pre-fix override for the four constants involved in the reported defect."""
         if not prefix:
             return sk.val(name)
-        return {"STATUS_SESS_Y": 100, "STATUS_STATE_Y": 118,
-                "HL_AUTH_Y": 134, "STATUS_DOT_DX": 50}.get(name, sk.val(name))
+        return {"STATUS_NUM_Y": 72, "STATUS_SESS_Y": 94, "STATUS_STATE_Y": 110,
+                "STATUS_DISK_BAR_DY": 32, "STATUS_DISK_LBL_DY": 10,
+                "STATUS_FOOTER_DY": 52, "STATUS_DOT_DX": 54, "STATUS_DOT_DY": 0,
+                "HL_HEAD_Y": 26, "HL_ROW0_Y": 48, "HL_ROW1_Y": 70, "HL_ROW2_Y": 92,
+                "HL_ROW3_Y": 114, "HL_AUTH_Y": 128, "HL_HOST_Y": 140,
+                "TK_DET1_Y": 88}.get(name, sk.val(name))
 
     def txt(page, name, x, y, s, font):
         w = text_w(s, font)
@@ -468,13 +478,13 @@ def overlap_boxes(sk, cx, cy, prefix=False):
     txt("STATUS", "number", cx, sk.val("STATUS_NUM_Y"), "999", "DejaVu40")
     txt("STATUS", "SESSIONS", cx, val("STATUS_SESS_Y", None), WORST["SESSIONS"], "Font2")
     txt("STATUS", "state", cx, val("STATUS_STATE_Y", None), WORST["STATE"], "Font2")
-    bar_y = cy + sk.val("STATUS_DISK_BAR_DY")
+    bar_y = cy + val("STATUS_DISK_BAR_DY", None)
     bar_w, bar_h = sk.val("STATUS_DISK_BAR_W"), sk.val("STATUS_DISK_BAR_H")
     rect("STATUS", "disk bar", cx - bar_w / 2.0, bar_y, bar_w, bar_h)
-    txt("STATUS", "disk label", cx, bar_y + sk.val("STATUS_DISK_LBL_DY"), WORST["DISK"], "Font0")
-    foot_y = cy + sk.val("STATUS_FOOTER_DY")
+    txt("STATUS", "disk label", cx, bar_y + val("STATUS_DISK_LBL_DY", None), WORST["DISK"], "Font0")
+    foot_y = cy + val("STATUS_FOOTER_DY", None)
     txt("STATUS", "footer", cx, foot_y, WORST["FOOTER"], "Font0")
-    circ("STATUS", "update dot", cx + val("STATUS_DOT_DX", None), foot_y, sk.val("STATUS_DOT_R"))
+    circ("STATUS", "update dot", cx + val("STATUS_DOT_DX", None), foot_y + val("STATUS_DOT_DY", None), sk.val("STATUS_DOT_R"))
 
     # ── TOKEN 24H and 7D (the two pages share the y positions but not the fonts) ──
     for page, det1 in (("TOKEN 24H", ("io", WORST["TK_IO"], "Font0")),
@@ -482,7 +492,7 @@ def overlap_boxes(sk, cx, cy, prefix=False):
         txt(page, "heading", cx, sk.val("TK_HEAD_Y"), WORST["TK_HEAD"], "Font0")
         txt(page, "qualifier", cx, sk.val("TK_QUAL_Y"), WORST["TK_QUAL"], "Font0")
         txt(page, "big total", cx, sk.val("TK_BIG_Y"), WORST["TK_BIG"], "DejaVu40")
-        txt(page, f"det1 {det1[0]}", cx, sk.val("TK_DET1_Y"), det1[1], det1[2])
+        txt(page, f"det1 {det1[0]}", cx, val("TK_DET1_Y", None), det1[1], det1[2])
         txt(page, "det2", cx, sk.val("TK_DET2_Y"),
             WORST["TK_CACHE"] if page == "TOKEN 24H" else WORST["TK_CALLS"],
             "Font0")
@@ -490,20 +500,24 @@ def overlap_boxes(sk, cx, cy, prefix=False):
             WORST["TK_CALLS"] if page == "TOKEN 24H" else WORST["TK_IO"], "Font0")
 
     # ── HEALTH ─────────────────────────────────────────────────────────────
-    txt("HEALTH", "heading", cx, sk.val("HL_HEAD_Y"), WORST["HL_HEAD"], "Font2")
-    rows = [sk.val(n) for n in ("HL_ROW0_Y", "HL_ROW1_Y", "HL_ROW2_Y", "HL_ROW3_Y")]
+    txt("HEALTH", "heading", cx, val("HL_HEAD_Y", None), WORST["HL_HEAD"], "Font2")
+    rows = [val(n, None) for n in ("HL_ROW0_Y", "HL_ROW1_Y", "HL_ROW2_Y", "HL_ROW3_Y")]
     for i, y in enumerate(rows):
         txt("HEALTH", f"row {i}", cx, y, WORST["HL_ROW"], "Font2")
         circ("HEALTH", f"row {i} dot", cx - sk.val("HL_DOT_DX"), y, sk.val("HL_DOT_R"))
     txt("HEALTH", "error 9E", cx + sk.val("HL_ERR_DX"), sk.val("HL_ERR_Y"), WORST["HL_ERR"], "Font0")
     txt("HEALTH", "auth", cx, val("HL_AUTH_Y", None), WORST["HL_AUTH"], "Font2")
-    txt("HEALTH", "host", cx, sk.val("HL_HOST_Y"), WORST["HL_HOST"], "Font0")
+    txt("HEALTH", "host", cx, val("HL_HOST_Y", None), WORST["HL_HOST"], "Font0")
 
     return out
 
 
-def check_overlaps(sk, cx, cy, prefix=False, min_px=MIN_OVERLAP_PX):
-    """Pairwise collision check per page. Returns (box_count, [(page, a, b, ox, oy)])."""
+def check_overlaps(sk, cx, cy, prefix=False, min_gap=MIN_GAP_PX):
+    """Pairwise separation check per page.
+
+    Returns (box_count, [(page, a, b, gap_x, gap_y)]) for every same-page pair that is
+    closer than min_gap on BOTH axes. A negative gap means the boxes intersect.
+    """
     boxes = overlap_boxes(sk, cx, cy, prefix=prefix)
     bad = []
     for i in range(len(boxes)):
@@ -512,10 +526,10 @@ def check_overlaps(sk, cx, cy, prefix=False, min_px=MIN_OVERLAP_PX):
             pj, nj, bx0, bx1, by0, by1 = boxes[j]
             if pi != pj:
                 continue
-            ox = min(ax1, bx1) - max(ax0, bx0)
-            oy = min(ay1, by1) - max(ay0, by0)
-            if ox > min_px and oy > min_px:
-                bad.append((pi, ni, nj, ox, oy))
+            gap_x = max(ax0, bx0) - min(ax1, bx1)
+            gap_y = max(ay0, by0) - min(ay1, by1)
+            if gap_x < min_gap and gap_y < min_gap:
+                bad.append((pi, ni, nj, gap_x, gap_y))
     return len(boxes), bad
 
 
@@ -580,8 +594,8 @@ def main(argv):
                   "overlap check cannot detect the defect it exists for.")
             return 1
         print(f"GATE OK — pre-fix layout correctly FAILS ({len(overlaps)} collision(s)):")
-        for page, a, b, ox, oy in overlaps:
-            print(f"  [{page}] {a} <-> {b}   overlap {ox:.1f}x{oy:.1f} px")
+        for page, a, b, gap_x, gap_y in overlaps:
+            print(f"  [{page}] {a} <-> {b}   gap {gap_x:.1f}x{gap_y:.1f} px (min {MIN_GAP_PX})")
         return 0
 
     if n_boxes != EXPECTED_BOXES:
@@ -593,8 +607,8 @@ def main(argv):
         print()
         print(f"OVERLAP FAILURE: {len(overlaps)} element pair(s) collide on screen "
               f"({n_boxes} boxes checked):")
-        for page, a, b, ox, oy in overlaps:
-            print(f"  [{page}] {a} <-> {b}   overlap {ox:.1f}x{oy:.1f} px")
+        for page, a, b, gap_x, gap_y in overlaps:
+            print(f"  [{page}] {a} <-> {b}   gap {gap_x:.1f}x{gap_y:.1f} px (min {MIN_GAP_PX})")
         return 1
 
     print(f"PASSED: all {len(res)} elements within R={limit}, all {len(sk.draws)} draw calls claimed, "

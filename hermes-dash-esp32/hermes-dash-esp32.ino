@@ -97,16 +97,19 @@ LGFX tft;
 #define STATUS_RING_DOT_R     4
 #define STATUS_OVERFLOW_DX    58     // CENTER_X + this = overflow x
 #define STATUS_OVERFLOW_DY    25     // CENTER_Y - this = overflow y
-#define STATUS_NUM_Y          72
+#define STATUS_NUM_Y          70     // was 72 — stack re-spaced for photo-calibrated bands
 #define STATUS_NUM_W          48     // DejaVu40 2-digit
-#define STATUS_SESS_Y         94     // was 100 — glyph band collided with the state line
-#define STATUS_STATE_Y        110    // was 118 — its band overlapped the disk bar (120..126)
+#define STATUS_SESS_Y         95     // was 94 — Font2's real band is 16px (measured), not 13
+#define STATUS_STATE_Y        113    // was 110 — a 16px band left a 0px gap to the bar
 #define STATUS_DISK_BAR_W     112
 #define STATUS_DISK_BAR_H     6
-#define STATUS_DISK_BAR_DY    32     // CENTER_Y + this (was 34 — clears the label)
-#define STATUS_DISK_LBL_DY    10     // disk_bar_y + this
-#define STATUS_FOOTER_DY      52     // CENTER_Y + this
-#define STATUS_DOT_DX         54     // CENTER_X + this (fixed inset; 54 keeps it clear of the bounded footer)
+#define STATUS_DISK_BAR_DY    37     // CENTER_Y + this
+#define STATUS_DISK_LBL_DY    12     // disk_bar_y + this — Font0's real 8px band needs >2px
+#define STATUS_FOOTER_DY      59     // CENTER_Y + this
+#define STATUS_DOT_DX         0      // CENTER_X + this — badge is centred (was 54, beside the text)
+#define STATUS_DOT_DY         10     // footer_y + this — BELOW the footer: at this depth the
+                                     // aperture (R=80) has no room beside the text, and putting
+                                     // it here is what lets the rows above keep real gaps
 #define STATUS_DOT_R          3
 
 // TOKENS page
@@ -114,22 +117,22 @@ LGFX tft;
 #define TK_QUAL_Y             34     // Font0
 #define TK_BIG_Y              66     // DejaVu40 (moved to fit 6-char worst case in R=80)
 #define TK_BIG_W              150    // 6 chars DejaVu40 worst case
-#define TK_DET1_Y             88     // Font0 for 24H IN/OUT (was Font2 — too wide for R=80)
+#define TK_DET1_Y             90     // was 88 — 7D's Font2 cost line needs 1.5px off the big total
 #define TK_DET2_Y             112    // Font0 (was 110)
 #define TK_DET3_Y             126    // Font0 (moved from 130 — calls worst-case r=79.3 at R=80)
 
 // HEALTH page
-#define HL_HEAD_Y             26
-#define HL_ROW0_Y             48
-#define HL_ROW1_Y             70
-#define HL_ROW2_Y             92
-#define HL_ROW3_Y             114
+#define HL_HEAD_Y             24
+#define HL_ROW0_Y             44
+#define HL_ROW1_Y             64
+#define HL_ROW2_Y             84
+#define HL_ROW3_Y             104
 #define HL_DOT_DX             56     // CENTER_X - this
 #define HL_DOT_R              3
 #define HL_ERR_DX             55     // CENTER_X + this
 #define HL_ERR_Y              92
-#define HL_AUTH_Y             128    // was 134 — glyph band overlapped the host line (136..144)
-#define HL_HOST_Y             140    // was 150 — exceeded R=80 (moved up)
+#define HL_AUTH_Y             122    // was 128 — a 16px band overlapped PLATFORMS by 2px
+#define HL_HOST_Y             136    // was 140 (kept inside R=80: worst 19-char "?" form)
 
 // ── Colors (RGB565) ───────────────────────────────────
 #define C_BG        0x0000  // black
@@ -715,7 +718,10 @@ void draw_footer() {
     tft.drawString(footer, CENTER_X, footer_y);
 
     if (can_update) {
-        tft.fillCircle(CENTER_X + STATUS_DOT_DX, footer_y, STATUS_DOT_R, C_YELLOW);
+        // Badge sits BELOW the footer (centred). Beside the text it competed with the
+        // footer's bounded width AND the aperture: at footer depth R=80 leaves no room
+        // out there. Placement calibrated against photographs of the panel.
+        tft.fillCircle(CENTER_X + STATUS_DOT_DX, footer_y + STATUS_DOT_DY, STATUS_DOT_R, C_YELLOW);
     }
 }
 
