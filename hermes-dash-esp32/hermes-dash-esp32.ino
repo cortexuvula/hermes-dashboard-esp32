@@ -198,6 +198,8 @@ unsigned long last_success = 0;          // A12: set AFTER successful fetch
 const unsigned long FETCH_INTERVAL = 10000; // 10s poll
 
 bool fetch_ok = false;
+String last_sig;          // flicker fix: last ui_signature() that was painted
+bool error_shown = false; // flicker fix: offline screen painted once per outage
 int  active_sessions = 0;
 bool active_sessions_known = false;
 bool gateway_busy    = false;
@@ -258,6 +260,46 @@ const int MAX_RESPONSE_SIZE = 32768;
 // ── Helpers ───────────────────────────────────────────
 // A6: age unknown → treat as stale (never present unknown as fresh)
 static inline bool is_stale() { return !g_age_known || g_usage_age_s > 60; }
+
+String fmt_tokens(long long v);   // defined below; ui_signature() formats through it
+
+// ── Flicker fix: change detection ─────────────────────
+// The panel is written directly (no canvas buffer), so EVERY repaint begins with a
+// full fillScreen and is visible as a flash. The 10s poll therefore flashed the whole
+// panel even when nothing had changed. ui_signature() summarises every value the UI
+// draws — as the DISPLAYED string, so it cannot drift from what is on screen — and the
+// loop repaints on a poll only when this differs.
+// Excluded on purpose: generated_at and usage_age_s (they change on every poll); the
+// age is folded into is_stale(), the only form the UI actually uses.
+String ui_signature() {
+    String s;
+    s.reserve(320);
+    s += (int)overall_known;          s += (int)gateway_busy;
+    s += (int)gateway_busy_known;     s += (int)gateway_degraded;
+    s += active_sessions;             s += (int)active_sessions_known;
+    s += (int)g_session_state;        s += (int)comp_gw;
+    s += (int)comp_dash;              s += (int)comp_storage;
+    s += (int)comp_platforms;         s += dash_errors;
+    s += (int)disk_known;             s += disk_pct;
+    s += version_str;                 s += (int)profile_known;
+    s += profile_count;               s += (int)can_update;
+    s += (int)g_host_known;           s += host_cpu;   s += host_ram;
+    s += g_platforms_rendered;        s += g_platforms_total;
+    for (int i = 0; i < g_platforms_rendered; i++) {
+        s += (int)g_platforms[i].connected;
+        s += (int)g_platforms[i].needs_attention;
+    }
+    s += g_schema;
+    for (const PeriodUsage* u : {&usage_24h, &usage_7d}) {
+        s += (int)u->valid;
+        s += fmt_tokens(u->total);   s += fmt_tokens(u->input);
+        s += fmt_tokens(u->output);  s += fmt_tokens(u->cache);
+        s += String(u->cost, 2);     s += fmt_tokens(u->calls);
+        s += fmt_tokens(u->sessions);
+    }
+    s += (int)is_stale();
+    return s;
+}
 
 // Token formatting (e.g. 79599877 → "79.6M")
 String fmt_tokens(long long v) {
@@ -816,8 +858,9 @@ void draw_health_page() {
 }
 
 // ── Render: full screen (rotates 4 pages) ─────────────
-void render() {
-    int page = (millis() / PAGE_MS) % PAGE_COUNT;
+// The page is passed in: the caller owns the schedule (loop) or the boot state (setup),
+// so a repaint cannot land on a different page than the one being tracked.
+void render(int page) {
     switch (page) {
         case 0: { // STATUS
             tft.fillScreen(C_BG);
@@ -876,10 +919,12 @@ void setup() {
         last_success = millis();  // A12: set AFTER success
         Serial.printf("[dash] fetch OK: %d sessions, %d/%d platforms, schema=%d\n",
                       active_sessions, g_platforms_rendered, g_platforms_total, g_schema);
-        render();
+        last_sig = ui_signature();   // flicker fix: baseline for change detection
+        render(0);
     } else {
         Serial.println("[dash] initial fetch FAILED");
         show_error();
+        error_shown = true;
     }
 }
 
@@ -897,17 +942,17 @@ void loop() {
     bool blink_now_on = (now / 400) % 2 == 0;
     bool blink_changed = (blink_now_on != blink_was_on);
 
-    // #5: blink redraw only on STATUS page (ring is the only thing that blinks)
-    bool should_redraw = page_changed;
-    if (!page_changed && blink_changed && fetch_ok && current_page == 0) {
-        should_redraw = true;
-    }
-
-    if (should_redraw) {
+    // FLICKER FIX: a full render() starts with fillScreen, so repainting the whole panel
+    // on every blink blanked the screen 2.5x/second on STATUS (blink toggles at 400ms).
+    // blink_on drives ONLY the ring dots — the single use in the sketch — so redraw just
+    // the ring here. A full repaint belongs to a page change.
+    if (page_changed) {
         current_page = new_page;
-        blink_was_on = blink_now_on;
-        if (fetch_ok) render();
+        if (fetch_ok) render(current_page);
+    } else if (blink_changed && fetch_ok && current_page == 0) {
+        draw_platform_ring();
     }
+    blink_was_on = blink_now_on;
 
     // Fetch on its own schedule (10s)
     if (now - last_fetch >= FETCH_INTERVAL) {
@@ -920,9 +965,18 @@ void loop() {
         fetch_ok = fetch_dashboard();
         if (fetch_ok) {
             last_success = millis();  // #1 A12: stamp AFTER success, not before
-            render();
-        } else {
+            error_shown = false;
+            // FLICKER FIX: repaint only when a value the UI draws actually changed — an
+            // unchanged poll used to flash the entire panel for nothing.
+            String sig = ui_signature();
+            if (sig != last_sig) {
+                last_sig = sig;
+                render(current_page);
+            }
+        } else if (!error_shown) {
+            // Paint the offline screen ONCE per outage, not every 10s.
             show_error();
+            error_shown = true;
         }
     }
 
