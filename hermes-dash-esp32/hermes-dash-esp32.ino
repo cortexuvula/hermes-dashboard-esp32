@@ -112,7 +112,7 @@ LGFX tft;
 // TOKENS page
 #define TK_HEAD_Y             24     // Font0 (was Font2@18 — exceeded R=80)
 #define TK_QUAL_Y             34     // Font0
-#define TK_BIG_Y              66     // DejaVu40 (moved down 4px for stale "?" suffix)
+#define TK_BIG_Y              66     // DejaVu40 (moved to fit 6-char worst case in R=80)
 #define TK_BIG_W              150    // 6 chars DejaVu40 worst case
 #define TK_DET1_Y             88     // Font0 for 24H IN/OUT (was Font2 — too wide for R=80)
 #define TK_DET2_Y             112    // Font0 (was 110)
@@ -293,10 +293,15 @@ bool fetch_dashboard() {
         // Known length: read in one shot (safe — already size-checked above)
         payload = http.getString();
     } else {
-        // #4: Unknown length (chunked): bounded stream read, abort on overflow
+        // #4/F2: Unknown length (chunked): bounded stream read, abort on overflow.
+        // Our relay currently answers HTTP/1.0 and CLOSES the socket after the body,
+        // so the loop exits immediately on !connected().  The idle guard below is
+        // a safety net for keep-alive or misbehaving responders — it prevents an
+        // 8 s burn inside loop() which would freeze page rotation, blink and LED.
         WiFiClient* stream = http.getStreamPtr();
         payload.reserve(4096);
         unsigned long t0 = millis();
+        unsigned long last_byte = millis();
         while (stream->connected() && (millis() - t0 < 8000)) {
             size_t avail = stream->available();
             if (avail) {
@@ -309,9 +314,11 @@ bool fetch_dashboard() {
                     return false;
                 }
                 payload.concat(buf, got);
+                last_byte = millis();
             } else {
                 delay(1);
-                if (!stream->available() && !stream->connected()) break;
+                // F2: idle guard — exit after 500 ms with no new bytes
+                if (millis() - last_byte > 500) break;
             }
         }
     }
@@ -589,11 +596,12 @@ void draw_center() {
 }
 
 // ── Render: gateway state line ────────────────────────
-// #2: absent overall → "UNKNOWN" (dim), never green RUNNING
+// #2/F1: absent overall → "UNKNOWN" (dim), never green RUNNING
+// gateway_busy alone must NOT certify RUNNING
 void draw_state() {
     tft.setFont(&fonts::Font2);
     tft.setTextDatum(MC_DATUM);
-    if (!overall_known && !gateway_busy_known) {
+    if (!overall_known) {
         tft.setTextColor(C_DIM, C_BG);
         tft.drawString("UNKNOWN", CENTER_X, STATUS_STATE_Y);
     } else if (gateway_degraded) {

@@ -9,7 +9,7 @@ firmware drifts:
                   draw call, so changing a font in the sketch changes this check.
 
 Every drawn element is modelled with a WORST-CASE string (longest version,
-two-digit bot count, 6-char token totals, "--" states, stale "?" suffixes) and
+two-digit bot count, 6-char token totals, "--" states) and
 tested against the round aperture:  r <= ROUND_R  where ROUND_R is parsed from
 the sketch (the project's own "usable radius inside round glass").
 
@@ -19,8 +19,11 @@ Envelope formula (center CX,CY):
   centered rect : r = hypot(max(|x-CX|,|x+w-CX|), max(|y-CY|,|y+h-CY|))
   circle        : r = hypot(|cx-CX| + rad, |cy-CY| + rad)
 
-#3: COMPLETENESS ASSERTION — every draw call the scanner finds must be CLAIMED
-by a model entry; an unclaimed draw call is a hard FAILURE with its line number.
+#3/F3: COMPLETENESS ASSERTION
+  - Broad scanner: matches ALL LovyanGFX draw/fill/push/print/setPixel calls
+    (not just a whitelist of known APIs).  An unscanned API cannot exist silently.
+  - Positional claiming: each claim must correspond to exactly ONE draw line,
+    and no draw line may be claimed twice.  A duplicated or moved element FAILS.
 
 Usage:
   python3 tools/check_layout.py               # current sketch: expect PASS (exit 0)
@@ -39,11 +42,27 @@ from pathlib import Path
 FONTS = {
     "Font0": (6, 8),
     "Font2": (8, 16),
-    "DejaVu24": (13, 24),   # #3: boot screen uses this
+    "DejaVu24": (13, 24),   # boot screen uses this
     "DejaVu40": (22, 40),   # digit advance; used for the big numbers
 }
 
 DEFAULT_SKETCH = Path(__file__).parent.parent / "hermes-dash-esp32" / "hermes-dash-esp32.ino"
+
+# Non-rendering calls to exclude from the draw surface scanner.
+# These set state but don't draw at specific coordinates.
+NON_RENDERING = {
+    "fillScreen",   # clears the whole screen — not a positioned element
+    "setFont",
+    "setTextColor",
+    "setTextDatum",
+    "begin",
+    "setRotation",
+    "end",
+}
+
+# Broad regex: any tft.* call that could place pixels on screen.
+# Matches: draw*, fill*, push*, print*, setPixel*
+DRAW_CALL_RE = re.compile(r"tft\.(draw|fill|push|print|setPixel)[A-Za-z0-9_]*\(")
 
 
 class Sketch:
@@ -62,9 +81,12 @@ class Sketch:
             fm = re.search(r"setFont\(&fonts::(\w+)\)", line)
             if fm:
                 font = fm.group(1)
-            # #3: include drawChar in the scanner
-            if re.search(r"\.(drawString|drawNumber|drawRect|fillRect|fillCircle|drawChar)\(", line):
-                self.draws.append((i, font, line.strip()))
+            # F3: broad scanner — catch ALL rendering APIs
+            if DRAW_CALL_RE.search(line):
+                # Exclude non-rendering calls
+                method_match = re.search(r"\.(\w+)\(", line)
+                if method_match and method_match.group(1) not in NON_RENDERING:
+                    self.draws.append((i, font, line.strip()))
 
     def val(self, name):
         if name not in self.const:
@@ -116,7 +138,7 @@ WORST = {
     "FOOTER": "v0.21.3  99 bots",
     "TK_HEAD": "TOKENS 24H",
     "TK_QUAL": "NEW SESSIONS ONLY",
-    "TK_BIG": "12345M",              # 6-char DejaVu40 worst case (stale shown via color/dim, not "?" suffix — see note)
+    "TK_BIG": "12345M",              # 6-char DejaVu40 worst case (staleness shown via dim color, not "?" suffix)
     "TK_IO": "IN 1234M  OUT 12345M?",     # 24H/7D in-out split, worst case incl. stale ?
     "TK_COST": "$9999.99?",               # 7D cost headline
     "TK_CACHE": "CACHE 1234M  $99.99",    # 24H cache + cost
@@ -126,7 +148,7 @@ WORST = {
     "HL_ERR": "9E",
     "HL_AUTH": "AUTH EXPIRED",
     "HL_HOST": "CPU 100% RAM 100%?",      # single space keeps it inside R=80
-    # #3: boot/error/wifi screens
+    # boot/error/wifi screens
     "BOOT_HERMES": "HERMES",
     "BOOT_DASH": "Dashboard",
     "ERR_OFFLINE": "OFFLINE",
@@ -141,18 +163,17 @@ def check(sk, prefix=False):
     cy = sk.val("CENTER_Y")
     limit = sk.val("ROUND_R")
     res = []
-    claimed = set()  # line numbers claimed by model entries
+    claimed = {}  # F3: line_no -> claimant name (positional, 1:1)
 
     def add(name, r, note="", line_no=None):
         res.append((name, r, r <= limit, note))
         if line_no is not None:
-            claimed.add(line_no)
-
-    def claim_all_matching(pattern):
-        """Claim ALL draw calls matching a pattern (handles conditional branches)."""
-        for line_no, font, text in sk.draws:
-            if pattern in text:
-                claimed.add(line_no)
+            if line_no in claimed:
+                # F3: duplicate claim = FAIL (catches BYPASS B)
+                res.append((f"DUPLICATE CLAIM at line {line_no}", 999, False,
+                            f"claimed by both {claimed[line_no]!r} and {name!r}"))
+            else:
+                claimed[line_no] = name
 
     def font_check(name, selector, expected):
         """Verify the sketch's draw site uses the font this check assumes."""
@@ -161,8 +182,8 @@ def check(sk, prefix=False):
             raise SystemExit(f"ERROR: {name}: no setFont found before {selector} (line {line_no})")
         if actual != expected:
             raise SystemExit(
-                f"ERROR: {name}: FONT MISMATCH — {selector} draws with fonts::{actual} "
-                f"(line {line_no}) but this check models fonts::{expected}. "
+                f"ERROR: {name}: FONT MISMATCH — {selector} draws with font::{actual} "
+                f"(line {line_no}) but this check models font::{expected}. "
                 f"Update the checker for the new font."
             )
         return actual, line_no
@@ -184,14 +205,20 @@ def check(sk, prefix=False):
     # ── STATUS page ────────────────────────────────────────────────────────
     ring_r = sk.val("STATUS_RING_R")
     dot_r = sk.val("STATUS_RING_DOT_R")
+    # Ring dots: there are exactly 8 fillCircle calls with STATUS_RING_DOT_R
+    # Claim them positionally: each dot gets the next unclaimed fillCircle with that pattern
+    ring_dot_lines = [ln for ln, f, t in sk.draws
+                      if "fillCircle" in t and "STATUS_RING_DOT_R" in t]
     for i in range(8):
         angle = 150 + i * (30 - 150) / 7
         rad = math.radians(angle)
         dx = int(ring_r * math.cos(rad))
         dy = int(ring_r * math.sin(rad))
-        # Claim ALL fillCircle calls for ring dots (handles for loop + conditional branches)
-        claim_all_matching("fillCircle(x, y, STATUS_RING_DOT_R")
-        add(f"ring dot {i}", circle_r(cx + dx, cy - dy, dot_r, cx, cy))
+        if i < len(ring_dot_lines):
+            add(f"ring dot {i}", circle_r(cx + dx, cy - dy, dot_r, cx, cy),
+                line_no=ring_dot_lines[i])
+        else:
+            add(f"ring dot {i}", circle_r(cx + dx, cy - dy, dot_r, cx, cy))
 
     f, ln = font_check("overflow", "STATUS_OVERFLOW_DX", "Font0")
     add("overflow +99", offset(cx + sk.val("STATUS_OVERFLOW_DX"),
@@ -199,54 +226,68 @@ def check(sk, prefix=False):
                               text_w(WORST["OVERFLOW"], f), text_h(f), cx, cy),
         line_no=ln)
 
-    # Claim ALL drawNumber/drawString calls at STATUS_NUM_Y (handles conditional branches)
-    claim_all_matching("drawNumber(active_sessions")
-    claim_all_matching("drawString(\"--\", CENTER_X, STATUS_NUM_Y")
+    # Big number: claim the first drawNumber or drawString at STATUS_NUM_Y
+    num_candidates = [ln for ln, f, t in sk.draws
+                      if ("drawNumber(active_sessions" in t or
+                          'drawString("--", CENTER_X, STATUS_NUM_Y' in t)
+                      and ln not in claimed]
     f, ln = font_check("big number", "STATUS_NUM_Y", "DejaVu40")
     add("number 999", centered(sk.val("STATUS_NUM_Y"), text_w("999", f), text_h(f), cx, cy),
         line_no=ln)
+    # Claim the alternate branch
+    for alt_ln in num_candidates:
+        if alt_ln != ln:
+            claimed[alt_ln] = "number 999 (alt branch)"
 
-    # Claim ALL sessions label branches
-    claim_all_matching("drawString(\"SESSION\"")
-    claim_all_matching("drawString(\"SESSIONS\"")
-    claim_all_matching("drawString(\"\", CENTER_X, STATUS_SESS_Y")
+    # Sessions label
+    sess_candidates = [ln for ln, f, t in sk.draws
+                       if ("SESSION" in t and "STATUS_SESS_Y" in t)
+                       or 'drawString("", CENTER_X, STATUS_SESS_Y' in t]
     f, ln = font_check("sessions label", "STATUS_SESS_Y", "Font2")
     add("SESSIONS", centered(sk.val("STATUS_SESS_Y"), text_w(WORST["SESSIONS"], f), text_h(f), cx, cy),
         line_no=ln)
+    for alt_ln in sess_candidates:
+        if alt_ln != ln and alt_ln not in claimed:
+            claimed[alt_ln] = "SESSIONS (alt branch)"
 
-    # Claim ALL state branches
-    claim_all_matching("drawString(\"UNKNOWN\"")
-    claim_all_matching("drawString(\"DEGRADED\"")
-    claim_all_matching("drawString(\"BUSY\"")
-    claim_all_matching("drawString(\"RUNNING\"")
+    # State label
+    state_candidates = [ln for ln, f, t in sk.draws
+                        if "STATUS_STATE_Y" in t and "drawString" in t]
     f, ln = font_check("state", "STATUS_STATE_Y", "Font2")
     add("DEGRADED", centered(sk.val("STATUS_STATE_Y"), text_w(WORST["STATE"], f), text_h(f), cx, cy),
         line_no=ln)
+    for alt_ln in state_candidates:
+        if alt_ln != ln and alt_ln not in claimed:
+            claimed[alt_ln] = "state (alt branch)"
 
+    # Disk bar
     bar_y = cy + sk.val("STATUS_DISK_BAR_DY")
     bar_w, bar_h = sk.val("STATUS_DISK_BAR_W"), sk.val("STATUS_DISK_BAR_H")
-    # Claim drawRect and fillRect for disk bar
-    for line_no, font, text in sk.draws:
-        if "drawRect(bar_x, bar_y" in text or "fillRect(bar_x + 1" in text:
-            claimed.add(line_no)
+    for ln, f, t in sk.draws:
+        if ("drawRect(bar_x, bar_y" in t or "fillRect(bar_x + 1" in t) and ln not in claimed:
+            claimed[ln] = "disk bar"
     add("disk bar", rect_r(cx - bar_w // 2, bar_y, bar_w, bar_h, cx, cy))
 
-    # Claim ALL disk label branches
-    claim_all_matching("drawString(\"DISK \"")
-    claim_all_matching("drawString(\"DISK --\"")
+    # Disk label
+    disk_candidates = [ln for ln, f, t in sk.draws
+                       if "DISK" in t and "STATUS_DISK_LBL_DY" in t]
     f, ln = font_check("disk label", "STATUS_DISK_LBL_DY", "Font0")
     add("DISK 100%", centered(bar_y + sk.val("STATUS_DISK_LBL_DY"),
                               text_w(WORST["DISK"], f), text_h(f), cx, cy),
         line_no=ln)
+    for alt_ln in disk_candidates:
+        if alt_ln != ln and alt_ln not in claimed:
+            claimed[alt_ln] = "DISK label (alt branch)"
 
+    # Footer
     foot_y = cy + sk.val("STATUS_FOOTER_DY")
     f, ln = font_check("footer", "drawString(footer", "Font0")
     add("footer", centered(foot_y, text_w(WORST["FOOTER"], f), text_h(f), cx, cy),
         line_no=ln)
-    # Claim the update dot
-    for line_no, font, text in sk.draws:
-        if "fillCircle(CENTER_X + STATUS_DOT_DX" in text:
-            claimed.add(line_no)
+    # Update dot
+    for ln, f, t in sk.draws:
+        if "fillCircle(CENTER_X + STATUS_DOT_DX" in t and ln not in claimed:
+            claimed[ln] = "update dot"
             break
     add("update dot", circle_r(cx + sk.val("STATUS_DOT_DX"), foot_y, sk.val("STATUS_DOT_R"), cx, cy))
 
@@ -259,14 +300,16 @@ def check(sk, prefix=False):
     add("tk qualifier", centered(sk.val("TK_QUAL_Y"), text_w(WORST["TK_QUAL"], f), text_h(f), cx, cy),
         line_no=ln)
 
-    # Claim ALL TK_BIG_Y branches
-    claim_all_matching("drawString(\"--\", CENTER_X, TK_BIG_Y")
-    claim_all_matching("drawString(fmt_tokens(u.total), CENTER_X, TK_BIG_Y")
+    # TK_BIG_Y branches: claim all drawString at TK_BIG_Y positionally
+    big_candidates = [ln for ln, f, t in sk.draws if "TK_BIG_Y" in t and "drawString" in t]
     f, ln = font_check("tk big total", "TK_BIG_Y", "DejaVu40")
     add("tk total", centered(sk.val("TK_BIG_Y"), text_w(WORST["TK_BIG"], f), text_h(f), cx, cy),
         line_no=ln)
+    for alt_ln in big_candidates:
+        if alt_ln != ln and alt_ln not in claimed:
+            claimed[alt_ln] = "tk total (alt branch)"
 
-    # TK_DET1_Y is used twice: 7D cost headline (Font2) and 24H in/out (Font0).
+    # TK_DET1_Y: 7D cost (Font2) and 24H io (Font0)
     f, ln = font_check("tk cost (7D)", "drawString(cost_s", "Font2")
     add("tk det1 cost/7D", centered(sk.val("TK_DET1_Y"), text_w(WORST["TK_COST"], f), text_h(f), cx, cy),
         line_no=ln)
@@ -274,6 +317,7 @@ def check(sk, prefix=False):
     add("tk det1 io/24H", centered(sk.val("TK_DET1_Y"), text_w(WORST["TK_IO"], f), text_h(f), cx, cy),
         line_no=ln)
 
+    # TK_DET2_Y
     f, ln = font_check("tk calls (7D)", "drawString(cs, CENTER_X, TK_DET2_Y", "Font0")
     add("tk det2 calls/7D", centered(sk.val("TK_DET2_Y"), text_w(WORST["TK_CALLS"], f), text_h(f), cx, cy),
         line_no=ln)
@@ -281,6 +325,7 @@ def check(sk, prefix=False):
     add("tk det2 cache/24H", centered(sk.val("TK_DET2_Y"), text_w(WORST["TK_CACHE"], f), text_h(f), cx, cy),
         line_no=ln)
 
+    # TK_DET3_Y
     f, ln = font_check("tk io (7D)", "drawString(io, CENTER_X, TK_DET3_Y", "Font0")
     add("tk det3 io/7D", centered(sk.val("TK_DET3_Y"), text_w(WORST["TK_IO"], f), text_h(f), cx, cy),
         line_no=ln)
@@ -288,21 +333,27 @@ def check(sk, prefix=False):
     add("tk det3 calls/24H", centered(sk.val("TK_DET3_Y"), text_w(WORST["TK_CALLS"], f), text_h(f), cx, cy),
         line_no=ln)
 
-    # ── HEALTH page ────────────────────────────────────────────────────────
+    # ── HEALTH page ────────────────────────────────────────────────
     f, ln = font_check("hl heading", "HL_HEAD_Y", "Font2")
     add("hl heading", centered(sk.val("HL_HEAD_Y"), text_w(WORST["HL_HEAD"], f), text_h(f), cx, cy),
         line_no=ln)
 
     row_names = ["GATEWAY", "STORAGE", "DASHBOARD", "PLATFORMS"]
+    # Find the single drawString(rows_txt line inside the for loop
+    rows_draw_lines = [ln for ln, f, t in sk.draws if "drawString(rows_txt" in t]
+    hl_dot_lines = [ln for ln, f, t in sk.draws
+                    if "fillCircle" in t and "HL_DOT_DX" in t]
     for i, cname in enumerate(["HL_ROW0_Y", "HL_ROW1_Y", "HL_ROW2_Y", "HL_ROW3_Y"]):
         y = sk.val(cname)
-        f, ln = font_check(f"hl row {i}", "drawString(rows_txt", "Font2")
+        f = "Font2"  # rows are always Font2
+        # Claim the shared for-loop draw line once (first iteration only)
+        claim_ln = rows_draw_lines[0] if i == 0 and rows_draw_lines else None
         add(f"hl row {i}",
             centered(y, text_w(WORST["HL_ROW"], f), text_h(f), cx, cy),
             f"worst label PLATFORMS; {row_names[i]} drawn here",
-            line_no=ln)
-        # Claim ALL health row dot fillCircle calls
-        claim_all_matching("fillCircle(CENTER_X - HL_DOT_DX")
+            line_no=claim_ln)
+        if i < len(hl_dot_lines) and hl_dot_lines[i] not in claimed:
+            claimed[hl_dot_lines[i]] = f"hl row {i} dot"
         add(f"hl row {i} dot", circle_r(cx - sk.val("HL_DOT_DX"), y, sk.val("HL_DOT_R"), cx, cy))
 
     f, ln = font_check("hl error", "HL_ERR_DX", "Font0")
@@ -318,12 +369,12 @@ def check(sk, prefix=False):
     add("hl host", centered(sk.val("HL_HOST_Y"), text_w(WORST["HL_HOST"], f), text_h(f), cx, cy),
         line_no=ln)
 
-    # ── #3: ERROR SCREEN (show_error) ──────────────────────────────────────
+    # ── ERROR SCREEN (show_error) ───────────────────────────
     f, ln = font_check("error offline", "OFFLINE", "Font2")
     add("error OFFLINE", centered(cy, text_w(WORST["ERR_OFFLINE"], f), text_h(f), cx, cy),
         line_no=ln)
 
-    # ── #3: BOOT SCREEN (setup) ────────────────────────────────────────────
+    # ── BOOT SCREEN (setup) ────────────────────────────────
     f, ln = font_check("boot HERMES", "HERMES", "DejaVu24")
     add("boot HERMES", centered(cy - 40, text_w(WORST["BOOT_HERMES"], f), text_h(f), cx, cy),
         line_no=ln)
@@ -331,7 +382,7 @@ def check(sk, prefix=False):
     add("boot Dashboard", centered(cy + 10, text_w(WORST["BOOT_DASH"], f), text_h(f), cx, cy),
         line_no=ln)
 
-    # ── #3: WIFI CONNECT SCREEN ────────────────────────────────────────────
+    # ── WIFI CONNECT SCREEN ────────────────────────────
     f, ln = font_check("wifi Connecting", "Connecting", "Font2")
     add("wifi Connecting", centered(cy - 20, text_w(WORST["WIFI_CONNECT"], f), text_h(f), cx, cy),
         line_no=ln)
@@ -339,9 +390,9 @@ def check(sk, prefix=False):
     add("wifi WiFi...", centered(cy + 10, text_w(WORST["WIFI_SSID"], f), text_h(f), cx, cy),
         line_no=ln)
     # Claim the drawChar dots
-    for line_no, font, text in sk.draws:
-        if "drawChar('.', CENTER_X" in text:
-            claimed.add(line_no)
+    for ln, f, t in sk.draws:
+        if "drawChar" in t and ln not in claimed:
+            claimed[ln] = "wifi dots"
 
     return res, cx, cy, limit, claimed
 
@@ -377,7 +428,7 @@ def main(argv):
         print("GATE BROKEN — pre-fix layout PASSED; the check does not detect the A11 defects")
         return 2
 
-    # #3: COMPLETENESS ASSERTION — every draw call must be claimed
+    # F3: COMPLETENESS ASSERTION — every draw call must be claimed (positional, 1:1)
     unclaimed = []
     for line_no, font, text in sk.draws:
         if line_no not in claimed:
