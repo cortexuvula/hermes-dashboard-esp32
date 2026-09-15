@@ -7,6 +7,8 @@
 // Chip: ESP32-C6 (RISC-V, 160MHz, 4MB Flash)
 // Libs: LovyanGFX (TFT_eSPI does not support C6 — VSPI registers don't exist on RISC-V)
 //       FastLED (WS2812 RGB on GPIO8)
+//
+// Audit fixes applied: A6, A7, A8, A9, A10, A11, A12
 
 #include "wifi_config.h"
 #ifndef WIFI_SSID
@@ -83,6 +85,7 @@ LGFX tft;
 #define CENTER_X  160
 #define CENTER_Y  86
 #define ROUND_R   80   // usable radius inside round glass
+#define APERTURE_R 76  // ROUND_R - 4 safety margin (A11)
 
 // ── Colors (RGB565) ───────────────────────────────────
 #define C_BG        0x0000  // black
@@ -99,11 +102,11 @@ LGFX tft;
 #define NUM_LEDS    1
 CRGB leds[NUM_LEDS];
 
-// Forward decls — globals are defined below (single-TU compile)
+// Forward decls
 extern bool fetch_ok;
 extern bool gateway_degraded;
 extern bool gateway_busy;
-extern unsigned long last_fetch;
+extern unsigned long last_success;
 
 void set_led(uint8_t r, uint8_t g, uint8_t b) {
     CRGB c(r, g, b);
@@ -116,86 +119,105 @@ void led_init() {
     set_led(0, 0, 0);
 }
 
-// Green flash on fetch, orange when busy/degraded, red when offline.
+// A12 fix: LED pulse uses last_success (set AFTER successful fetch),
+// not last_fetch (which was set before the network call).
 void led_update() {
     if (!fetch_ok)                 { set_led(255, 0, 0); }     // offline
     else if (gateway_degraded || gateway_busy) { set_led(255, 120, 0); } // busy/degraded
-    else if (millis() - last_fetch < 250)      { set_led(0, 200, 0); }   // fresh fetch
+    else if (millis() - last_success < 250)    { set_led(0, 200, 0); }   // fresh fetch pulse
     else                           { set_led(0, 0, 0); }
 }
 
-// ── Globals ───────────────────────────────────────────
-unsigned long last_fetch = 0;
-const unsigned long FETCH_INTERVAL = 10000; // 10s poll
-bool fetch_ok = false;
+// ── A7: Period usage struct (one per time window) ─────
+// No page may read another period's data.
+struct PeriodUsage {
+    long long total  = 0;
+    long long input  = 0;
+    long long output = 0;
+    long long cache  = 0;
+    double    cost   = 0.0;
+    long long calls  = 0;
+    long long sessions = 0;
+    bool      valid  = false;  // false = data absent/null → show "--"
+};
 
-int active_sessions = 0;
-int active_agents = 0;
-bool gateway_busy = false;
+// ── A10: Per-platform state (max 8 rendered) ──────────
+#define MAX_PLATFORMS 8
+struct PlatformState {
+    bool connected      = false;
+    bool needs_attention = false;
+};
+
+// ── Globals ───────────────────────────────────────────
+unsigned long last_fetch   = 0;
+unsigned long last_success = 0;          // A12: set AFTER successful fetch
+const unsigned long FETCH_INTERVAL = 10000; // 10s poll
+
+bool fetch_ok = false;
+int  active_sessions = 0;
+int  active_agents   = 0;
+bool gateway_busy    = false;
 bool gateway_degraded = false;
-int platforms_up = 0;
-int platforms_total = 0;
-int attention_idx[8];
-int attention_count = 0;
-int disk_pct = 0;
+
+// A10: per-platform state replaces attention_idx[] and platforms_up
+PlatformState g_platforms[MAX_PLATFORMS];
+int g_platforms_rendered = 0;  // how many dots to draw (0–8)
+int g_platforms_total    = 0;  // actual total from JSON (for overflow marker)
+
+int    disk_pct = 0;
 String version_str = "";
 String profile_count = "";
+bool   can_update = false;
 
-bool can_update = false;
-bool session_valid = true;
+// A6 tri-state session validity (was boolean)
+enum SessionState : uint8_t {
+    SESS_UNKNOWN  = 0,
+    SESS_EXPIRED  = 1,
+    SESS_OK       = 2
+};
+SessionState g_session_state = SESS_UNKNOWN;
 
-// Components health (gateway/dashboard/storage/platforms from /api/status)
-bool comp_gw_ok = true, comp_dash_ok = true, comp_storage_ok = true, comp_platforms_ok = true;
+// A6 tri-state component health
+enum CompState : uint8_t {
+    COMP_UNKNOWN = 0,
+    COMP_DOWN    = 1,
+    COMP_OK      = 2
+};
+CompState comp_gw = COMP_UNKNOWN, comp_dash = COMP_UNKNOWN,
+          comp_storage = COMP_UNKNOWN, comp_platforms = COMP_UNKNOWN;
 int dash_errors = 0;
 
-// ── Token usage (merged by relay from Mac usage-server) ──
-long long tokens_total_24h = 0;
-long long tokens_in_24h = 0;
-long long tokens_out_24h = 0;
-long long tokens_cache_24h = 0;
-double tokens_cost_24h = 0.0;
-long long tokens_calls_24h = 0;
-long long tokens_sess_24h = 0;
+// A6: host absent → unknown (not silently carried over)
+bool g_host_known = false;
+int  host_cpu = 0;
+int  host_ram = 0;
 
-long long tokens_total_7d = 0;
-double tokens_cost_7d = 0.0;
-long long tokens_calls_7d = 0;
-long long tokens_sess_7d = 0;
+// A7: one struct per period — no cross-period reads
+PeriodUsage usage_24h;
+PeriodUsage usage_7d;
 
-// Host stats (Mac running the gateway)
-int host_cpu = 0;
-int host_ram = 0;
+// A6: staleness from usage_age_s (board has no clock/NTP)
+int  g_usage_age_s = -1;  // -1 = unknown; >60 = stale
+int  g_schema      = 0;   // contract version; 0 = not seen
 
 const unsigned long PAGE_MS = 12000; // rotate pages every 12s
 const int PAGE_COUNT = 4;            // STATUS / TOKENS 24H / TOKENS 7D / HEALTH
 
-// ── WiFi ──────────────────────────────────────────────
-void wifi_connect() {
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("[dash] connecting to %s...\n", WIFI_SSID);
-    tft.fillScreen(C_BG);
-    tft.setTextColor(C_TEXT, C_BG);
-    tft.setTextDatum(MC_DATUM);
-    tft.setFont(&fonts::Font2);
-    tft.drawString("Connecting", CENTER_X, CENTER_Y - 20);
-    tft.drawString("WiFi...", CENTER_X, CENTER_Y + 10);
+// A9: max response size (32 KB — protect no-PSRAM heap)
+const int MAX_RESPONSE_SIZE = 32768;
 
-    int dots = 0;
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        dots++;
-        if (dots % 20 == 0) { // every 10s
-            Serial.printf("[dash] ...still connecting (%lus), status=%d\n", (millis() - t0) / 1000, WiFi.status());
-        }
-        tft.drawChar('.', CENTER_X - 12 + (dots % 3) * 12, CENTER_Y + 40);
-        if (millis() - t0 > 45000) break; // hidden SSID + slow router: cap at 45s
-    }
-    tft.fillScreen(C_BG);
-    Serial.printf("[dash] WiFi status=%d, IP %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
+// ── Helpers ───────────────────────────────────────────
+static inline bool is_stale() { return g_usage_age_s > 60; }
+
+// Token formatting (e.g. 79599877 → "79.6M")
+String fmt_tokens(long long v) {
+    if (v >= 100000000LL) { char b[16]; snprintf(b, sizeof b, "%.0fM", v / 1000000.0); return b; }
+    if (v >= 1000000LL)   { char b[16]; snprintf(b, sizeof b, "%.1fM", v / 1000000.0); return b; }
+    if (v >= 1000LL)      { char b[16]; snprintf(b, sizeof b, "%.0fk", v / 1000.0); return b; }
+    return String((long)v);
 }
 
-// ── JSON fetch ────────────────────────────────────────
+// ── JSON fetch (A6/A7/A9) ────────────────────────────
 bool fetch_dashboard() {
     HTTPClient http;
     http.begin(DASHBOARD_URL);
@@ -207,124 +229,211 @@ bool fetch_dashboard() {
         return false;
     }
 
+    // A9: reject oversized responses (protect ~300KB heap on no-PSRAM C6)
+    int resp_size = http.getSize();
+    if (resp_size > MAX_RESPONSE_SIZE) {
+        Serial.printf("[dash] response too large: %d bytes (max %d) — rejected\n", resp_size, MAX_RESPONSE_SIZE);
+        http.end();
+        return false;
+    }
+
     String payload = http.getString();
     http.end();
 
-    // Parse JSON (ArduinoJson v7 — JsonDocument grows as needed)
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    if (err) return false;
-
-    active_sessions = doc["active_sessions"] | 0;
-    active_agents = doc["active_agents"] | 0;
-    gateway_busy = doc["gateway_busy"] | false;
-    version_str = doc["version"] | "?";
-    const char* overall = doc["overall"];
-    gateway_degraded = (overall && strcmp(overall, "degraded") == 0);
-
-    // Count platforms + flag attention platforms
-    platforms_up = 0;
-    platforms_total = 0;
-    attention_count = 0;
-    JsonObject platforms = doc["gateway_platforms"].as<JsonObject>();
-    int pi = 0;
-    for (JsonPair kv : platforms) {
-        platforms_total++;
-        const char* state = kv.value()["state"];
-        if (state && strcmp(state, "connected") == 0) platforms_up++;
-        if (kv.value()["needs_attention"] | false) {
-            if (attention_count < 8) attention_idx[attention_count++] = pi;
-        }
-        pi++;
+    if ((int)payload.length() > MAX_RESPONSE_SIZE) {
+        Serial.printf("[dash] payload too large after read: %d bytes — rejected\n", (int)payload.length());
+        return false;
     }
 
-    // Disk (use | 0.0 — | 0 falls back on float values in ArduinoJson)
+    // A9: ArduinoJson filter — only retain fields the board uses.
+    // This avoids a full duplicate document on a no-PSRAM device.
+    JsonDocument filter;
+    filter["active_sessions"]      = true;
+    filter["active_agents"]        = true;
+    filter["gateway_busy"]         = true;
+    filter["version"]              = true;
+    filter["overall"]              = true;
+    filter["gateway_platforms"]    = true;
+    filter["disk"]                 = true;
+    filter["profiles"]             = true;
+    filter["can_update_hermes"]    = true;
+    filter["nous_session_valid"]   = true;
+    filter["components"]           = true;
+    filter["tokens_24h"]           = true;
+    filter["tokens_7d"]            = true;
+    filter["host"]                 = true;
+    filter["usage_age_s"]          = true;
+    filter["schema"]               = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    if (err) {
+        // A9: distinguish parse errors from network errors in serial log
+        Serial.printf("[dash] JSON PARSE ERROR: %s\n", err.c_str());
+        return false;
+    }
+
+    // --- Core fields ---
+    active_sessions   = doc["active_sessions"] | 0;
+    active_agents     = doc["active_agents"]   | 0;
+    gateway_busy      = doc["gateway_busy"]    | false;
+    version_str       = doc["version"]         | "?";
+    const char* overall = doc["overall"];
+    gateway_degraded  = (overall && strcmp(overall, "degraded") == 0);
+
+    // A6: schema version (log at boot, tolerate unknown)
+    if (doc["schema"].is<int>()) {
+        g_schema = doc["schema"].as<int>();
+    }
+
+    // A6: staleness — usage_age_s (null = unknown)
+    if (doc["usage_age_s"].is<int>()) {
+        g_usage_age_s = doc["usage_age_s"].as<int>();
+    } else {
+        g_usage_age_s = -1;
+    }
+
+    // --- A10: Platforms — per-platform state, max 8 rendered ---
+    g_platforms_total    = 0;
+    g_platforms_rendered = 0;
+    JsonObject platforms = doc["gateway_platforms"].as<JsonObject>();
+    for (JsonPair kv : platforms) {
+        int idx = g_platforms_total;
+        g_platforms_total++;
+        if (idx < MAX_PLATFORMS) {
+            const char* state = kv.value()["state"];
+            g_platforms[idx].connected      = (state && strcmp(state, "connected") == 0);
+            g_platforms[idx].needs_attention = kv.value()["needs_attention"] | false;
+            g_platforms_rendered++;
+        }
+        // entries beyond MAX_PLATFORMS are counted for overflow marker only
+    }
+
+    // Disk
     JsonObject disk = doc["disk"];
     disk_pct = (int)(disk["used_percent"] | 0.0);
 
-    // Profile count
+    // Profiles
     JsonArray profiles = doc["profiles"].as<JsonArray>();
     profile_count = String(profiles.size());
 
-    // Update + session health
+    // Update availability
     can_update = doc["can_update_hermes"] | false;
-    const char* nsv = doc["nous_session_valid"];
-    session_valid = (nsv && strcmp(nsv, "valid") == 0);
 
-    // Component health
+    // A6: session validity — tri-state (OK / EXPIRED / UNKNOWN)
+    if (doc["nous_session_valid"].isNull() || !doc.containsKey("nous_session_valid")) {
+        g_session_state = SESS_UNKNOWN;
+    } else {
+        const char* nsv = doc["nous_session_valid"];
+        if (nsv && strcmp(nsv, "valid") == 0) g_session_state = SESS_OK;
+        else                                   g_session_state = SESS_EXPIRED;
+    }
+
+    // A6: components — null = UNKNOWN (not silently healthy)
     JsonObject comp = doc["components"];
-    if (comp.isNull()) {
-        comp_gw_ok = comp_dash_ok = comp_storage_ok = comp_platforms_ok = true;
+    if (comp.isNull() || !doc.containsKey("components")) {
+        comp_gw = comp_dash = comp_storage = comp_platforms = COMP_UNKNOWN;
         dash_errors = 0;
     } else {
-        comp_gw_ok        = (strcmp(comp["gateway"]["status"]   | "?", "ok") == 0);
-        comp_dash_ok      = (strcmp(comp["dashboard"]["status"] | "?", "ok") == 0);
-        dash_errors       = comp["dashboard"]["recent_unhandled_errors"] | 0;
-        comp_storage_ok   = (strcmp(comp["storage"]["status"]   | "?", "ok") == 0);
-        comp_platforms_ok = (strcmp(comp["platforms"]["status"] | "?", "ok") == 0);
+        comp_gw        = (strcmp(comp["gateway"]["status"]   | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
+        comp_dash      = (strcmp(comp["dashboard"]["status"] | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
+        dash_errors    = comp["dashboard"]["recent_unhandled_errors"] | 0;
+        comp_storage   = (strcmp(comp["storage"]["status"]   | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
+        comp_platforms = (strcmp(comp["platforms"]["status"] | "?", "ok") == 0) ? COMP_OK : COMP_DOWN;
     }
 
-    // Token usage (best-effort — absent when the usage server is down)
-    JsonObject tk = doc["tokens_24h"];
-    if (!tk.isNull()) {
-        tokens_total_24h = tk["total"] | 0LL;
-        tokens_in_24h    = tk["input"]  | 0LL;
-        tokens_out_24h   = tk["output"] | 0LL;
-        tokens_cache_24h = tk["cache"]  | 0LL;
-        tokens_cost_24h  = tk["est_cost"] | 0.0;
-        tokens_calls_24h = tk["api_calls"] | 0LL;
-        tokens_sess_24h  = tk["sessions"] | 0LL;
+    // A7: token usage — one struct per period, null = absent
+    JsonObject tk24 = doc["tokens_24h"];
+    if (!tk24.isNull() && doc.containsKey("tokens_24h")) {
+        usage_24h.total    = tk24["total"]    | 0LL;
+        usage_24h.input    = tk24["input"]    | 0LL;
+        usage_24h.output   = tk24["output"]   | 0LL;
+        usage_24h.cache    = tk24["cache"]    | 0LL;
+        usage_24h.cost     = tk24["est_cost"] | 0.0;
+        usage_24h.calls    = tk24["api_calls"]| 0LL;
+        usage_24h.sessions = tk24["sessions"] | 0LL;
+        usage_24h.valid    = true;
     } else {
-        tokens_total_24h = tokens_in_24h = tokens_out_24h = tokens_cache_24h = 0;
-        tokens_cost_24h = 0.0;
-        tokens_calls_24h = tokens_sess_24h = 0;
+        usage_24h = PeriodUsage();  // reset — valid=false → show "--"
     }
 
+    // A7 fix: 7d now reads ALL fields including input/output (was missing)
     JsonObject tk7 = doc["tokens_7d"];
-    if (!tk7.isNull()) {
-        tokens_total_7d = tk7["total"] | 0LL;
-        tokens_cost_7d  = tk7["est_cost"] | 0.0;
-        tokens_calls_7d = tk7["api_calls"] | 0LL;
-        tokens_sess_7d  = tk7["sessions"] | 0LL;
+    if (!tk7.isNull() && doc.containsKey("tokens_7d")) {
+        usage_7d.total    = tk7["total"]    | 0LL;
+        usage_7d.input    = tk7["input"]    | 0LL;
+        usage_7d.output   = tk7["output"]   | 0LL;
+        usage_7d.cache    = tk7["cache"]    | 0LL;
+        usage_7d.cost     = tk7["est_cost"] | 0.0;
+        usage_7d.calls    = tk7["api_calls"]| 0LL;
+        usage_7d.sessions = tk7["sessions"] | 0LL;
+        usage_7d.valid    = true;
     } else {
-        tokens_total_7d = 0;
-        tokens_cost_7d = 0.0;
-        tokens_calls_7d = tokens_sess_7d = 0;
+        usage_7d = PeriodUsage();
     }
 
-    // Host stats (best-effort)
+    // A6: host — null/absent = UNKNOWN (not silently carried over)
     JsonObject host = doc["host"];
-    if (!host.isNull()) {
-        host_cpu = host["cpu_percent"] | 0;
-        host_ram = host["ram_used_percent"] | 0;
+    if (!host.isNull() && doc.containsKey("host")) {
+        host_cpu = host["cpu_percent"]     | 0;
+        host_ram = host["ram_used_percent"]| 0;
+        g_host_known = true;
+    } else {
+        g_host_known = false;
+        // values retained but g_host_known=false → render as "--"
     }
 
     return true;
 }
 
-// ── Render: platform status ring (attention platforms blink) ──
-void draw_platform_ring(int up, int total) {
-    if (total < 2) return;
+// ── Render: platform ring (A10) ───────────────────────
+// Dots in arc 150°→30°, colour from per-platform state (not index).
+// Handles total 0, 1, ≤8, and >8 (overflow marker).
+void draw_platform_ring() {
+    int n = g_platforms_rendered;
+    if (n == 0 && g_platforms_total == 0) return;  // no platforms → nothing
+
     bool blink_on = (millis() / 400) % 2 == 0;
-    // Dots in an arc across the TOP of the round display (angles 150°→30°)
-    int radius = ROUND_R - 20;
-    int start_angle = 150; // lower-left
-    int end_angle = 30;    // lower-right (sweeps 120° over the top)
+    int ring_r = ROUND_R - 30;  // 50 — inset for aperture
+    float start_angle = 150.0f;
+    float end_angle   = 30.0f;
 
-    for (int i = 0; i < total; i++) {
-        float angle = start_angle + (float)i / (total - 1) * (end_angle - start_angle);
-        float rad = angle * PI / 180.0;
-        int x = CENTER_X + radius * cos(rad);
-        int y = CENTER_Y - radius * sin(rad);   // sin>0 → above center → top arc
-
-        bool attn = false;
-        for (int a = 0; a < attention_count; a++) if (attention_idx[a] == i) attn = true;
-
+    if (n == 1) {
+        // Single dot at arc midpoint (top center)
+        float rad = 90.0f * PI / 180.0f;
+        int x = CENTER_X + (int)(ring_r * cos(rad));
+        int y = CENTER_Y - (int)(ring_r * sin(rad));
         uint16_t color;
-        if (attn)      color = blink_on ? C_YELLOW : C_BG;   // blink while retrying
-        else if (i < up) color = C_OK;
-        else             color = C_DOWN;
+        if (g_platforms[0].needs_attention) color = blink_on ? C_YELLOW : C_BG;
+        else if (g_platforms[0].connected)  color = C_OK;
+        else                                 color = C_DOWN;
         tft.fillCircle(x, y, 4, color);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        float angle;
+        if (n > 1) angle = start_angle + (float)i / (n - 1) * (end_angle - start_angle);
+        else       angle = 90.0f;
+        float rad = angle * PI / 180.0f;
+        int x = CENTER_X + (int)(ring_r * cos(rad));
+        int y = CENTER_Y - (int)(ring_r * sin(rad));
+
+        // A10 fix: colour from THIS platform's state (not i < platforms_up)
+        uint16_t color;
+        if (g_platforms[i].needs_attention) color = blink_on ? C_YELLOW : C_BG;
+        else if (g_platforms[i].connected)   color = C_OK;
+        else                                  color = C_DOWN;
+        tft.fillCircle(x, y, 4, color);
+    }
+
+    // Overflow marker when total exceeds MAX_PLATFORMS
+    if (g_platforms_total > MAX_PLATFORMS) {
+        int overflow = g_platforms_total - MAX_PLATFORMS;
+        tft.setFont(&fonts::Font0);
+        tft.setTextColor(C_YELLOW, C_BG);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("+" + String(overflow), CENTER_X + ring_r + 8, CENTER_Y - ring_r / 2);
     }
 }
 
@@ -332,117 +441,142 @@ void draw_platform_ring(int up, int total) {
 void draw_center(int sessions) {
     tft.setTextColor(C_TEXT, C_BG);
     tft.setTextDatum(MC_DATUM);
-
-    // Big number
     tft.setFont(&fonts::DejaVu40);
-    tft.drawNumber(sessions, CENTER_X, CENTER_Y - 12);
-
-    // Label below
+    tft.drawNumber(sessions, CENTER_X, CENTER_Y - 14);
     tft.setFont(&fonts::Font2);
-    tft.drawString(sessions == 1 ? "SESSION" : "SESSIONS", CENTER_X, CENTER_Y + 22);
+    tft.drawString(sessions == 1 ? "SESSION" : "SESSIONS", CENTER_X, CENTER_Y + 14);
 }
 
 // ── Render: gateway state line ────────────────────────
 void draw_state(bool busy, bool degraded) {
     tft.setFont(&fonts::Font2);
+    tft.setTextDatum(MC_DATUM);
     if (degraded) {
         tft.setTextColor(C_DEGRADED, C_BG);
-        tft.drawString("DEGRADED", CENTER_X, CENTER_Y + 40);
+        tft.drawString("DEGRADED", CENTER_X, CENTER_Y + 32);
     } else if (busy) {
         tft.setTextColor(C_YELLOW, C_BG);
-        tft.drawString("BUSY", CENTER_X, CENTER_Y + 40);
+        tft.drawString("BUSY", CENTER_X, CENTER_Y + 32);
     } else {
         tft.setTextColor(C_OK, C_BG);
-        tft.drawString("RUNNING", CENTER_X, CENTER_Y + 40);
+        tft.drawString("RUNNING", CENTER_X, CENTER_Y + 32);
     }
 }
 
-// ── Render: disk bar at bottom ────────────────────────
+// ── Render: disk bar (A11: moved up inside aperture) ──
 void draw_disk_bar(int pct) {
-    int bar_w = ROUND_R * 2 - 20;
+    int bar_w = 112;   // A11: narrower to fit aperture
     int bar_h = 6;
-    int bar_x = CENTER_X - bar_w / 2;
-    int bar_y = CENTER_Y + ROUND_R - 26;   // 140 in landscape
+    int bar_x = CENTER_X - bar_w / 2;  // 104
+    int bar_y = CENTER_Y + 34;          // 120
 
     tft.drawRect(bar_x, bar_y, bar_w, bar_h, C_DIM);
-
     uint16_t bar_color = (pct > 85) ? C_DOWN : (pct > 70) ? C_DEGRADED : C_OK;
     int fill = (bar_w - 2) * pct / 100;
     if (fill > 0) tft.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, bar_color);
 
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
-    tft.drawString("DISK " + String(pct) + "%", CENTER_X, bar_y + 10);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("DISK " + String(pct) + "%", CENTER_X, bar_y + 10);  // y=130
 }
 
-// ── Render: footer — version + profiles + update dot ──
+// ── Render: footer (A11: moved up, dot at fixed inset) ─
 void draw_footer(const String& ver, const String& pro) {
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
+    tft.setTextDatum(MC_DATUM);
+    int footer_y = CENTER_Y + 52;  // 138
     String footer = "v" + ver + "  " + pro + " bots";
-    tft.drawString(footer, CENTER_X, CENTER_Y + ROUND_R - 4);   // 162
+    tft.drawString(footer, CENTER_X, footer_y);
 
+    // A11 fix: dot at FIXED position (not after text end).
+    // Its radius from center is independent of version string length.
     if (can_update) {
-        int w = tft.textWidth(footer);
-        tft.fillCircle(CENTER_X + w / 2 + 10, CENTER_Y + ROUND_R - 4, 3, C_YELLOW);
+        tft.fillCircle(CENTER_X + 50, footer_y, 3, C_YELLOW);  // (210, 138)
     }
 }
 
-// ── Token formatting (e.g. 79599877 → "79.6M") ────────
-String fmt_tokens(long long v) {
-    if (v >= 100000000LL) { char b[16]; snprintf(b, sizeof b, "%.0fM", v / 1000000.0); return b; }
-    if (v >= 1000000LL)   { char b[16]; snprintf(b, sizeof b, "%.1fM", v / 1000000.0); return b; }
-    if (v >= 1000LL)      { char b[16]; snprintf(b, sizeof b, "%.0fk", v / 1000.0); return b; }
-    return String((long)v);
-}
-
-// ── Render: tokens page (24h or 7d) ───────────────────
+// ── Render: tokens page (A7 + A8) ─────────────────────
+// Each page reads ONLY its own PeriodUsage struct — no cross-period access.
 void draw_tokens_page(bool is7d) {
     tft.fillScreen(C_BG);
     tft.setTextDatum(MC_DATUM);
 
-    long long total = is7d ? tokens_total_7d : tokens_total_24h;
-    double cost    = is7d ? tokens_cost_7d  : tokens_cost_24h;
-    long long calls = is7d ? tokens_calls_7d : tokens_calls_24h;
-    long long sess  = is7d ? tokens_sess_7d  : tokens_sess_24h;
+    // A7: read from THIS period's struct only
+    const PeriodUsage& u = is7d ? usage_7d : usage_24h;
 
     // Heading
     tft.setTextColor(C_DIM, C_BG);
     tft.setFont(&fonts::Font2);
     tft.drawString(is7d ? "TOKENS 7D" : "TOKENS 24H", CENTER_X, 18);
 
-    // Big total
+    // A8: honest qualifier — cohort totals, not rolling windows
+    tft.setFont(&fonts::Font0);
+    tft.drawString("NEW SESSIONS ONLY", CENTER_X, 32);
+
+    // Big total (A6: "--" for absent, "0" for real zero)
     tft.setTextColor(C_TEXT, C_BG);
     tft.setFont(&fonts::DejaVu40);
-    tft.drawString(total > 0 ? fmt_tokens(total) : "--", CENTER_X, 52);
+    String total_str;
+    if (!u.valid) {
+        total_str = "--";
+    } else if (is_stale()) {
+        total_str = fmt_tokens(u.total) + "?";  // visible but marked stale
+    } else {
+        total_str = fmt_tokens(u.total);
+    }
+    tft.drawString(total_str, CENTER_X, 58);
 
     if (is7d) {
         // Cost headline
         tft.setTextColor(C_TEXT, C_BG);
         tft.setFont(&fonts::Font2);
-        tft.drawString("$" + String(cost, 2), CENTER_X, 90);
+        String cost_s = u.valid ? ("$" + String(u.cost, 2)) : "--";
+        if (u.valid && is_stale()) cost_s += "?";
+        tft.drawString(cost_s, CENTER_X, 88);
+
         // Calls / sessions
         tft.setTextColor(C_DIM, C_BG);
         tft.setFont(&fonts::Font0);
-        tft.drawString("CALLS " + fmt_tokens(calls) + "  SES " + String(sess), CENTER_X, 114);
-        // In/Out split
-        tft.drawString("IN " + fmt_tokens(tokens_in_24h) + "  OUT " + fmt_tokens(tokens_out_24h), CENTER_X, 140);
+        String cs = u.valid
+            ? ("CALLS " + fmt_tokens(u.calls) + "  SES " + String(u.sessions))
+            : "CALLS --  SES --";
+        tft.drawString(cs, CENTER_X, 112);
+
+        // In/Out split — A7 fix: reads usage_7d.input/output (was reading 24h)
+        String io = u.valid
+            ? ("IN " + fmt_tokens(u.input) + "  OUT " + fmt_tokens(u.output))
+            : "IN --  OUT --";
+        if (u.valid && is_stale()) io += "?";
+        tft.drawString(io, CENTER_X, 136);
     } else {
         // In/Out split
         tft.setTextColor(C_TEXT, C_BG);
         tft.setFont(&fonts::Font2);
-        String io = "IN " + fmt_tokens(tokens_in_24h) + "  OUT " + fmt_tokens(tokens_out_24h);
-        tft.drawString(io, CENTER_X, 90);
+        String io = u.valid
+            ? ("IN " + fmt_tokens(u.input) + "  OUT " + fmt_tokens(u.output))
+            : "IN --  OUT --";
+        if (u.valid && is_stale()) io += "?";
+        tft.drawString(io, CENTER_X, 88);
+
         // Cache + cost
         tft.setTextColor(C_DIM, C_BG);
         tft.setFont(&fonts::Font0);
-        tft.drawString("CACHE " + fmt_tokens(tokens_cache_24h) + "  $" + String(cost, 2), CENTER_X, 114);
-        // Calls / sessions today
-        tft.drawString("CALLS " + fmt_tokens(calls) + "  SES " + String(sess), CENTER_X, 140);
+        String cc = u.valid
+            ? ("CACHE " + fmt_tokens(u.cache) + "  $" + String(u.cost, 2))
+            : "CACHE --  $--";
+        tft.drawString(cc, CENTER_X, 112);
+
+        // Calls / sessions
+        String cs = u.valid
+            ? ("CALLS " + fmt_tokens(u.calls) + "  SES " + String(u.sessions))
+            : "CALLS --  SES --";
+        tft.drawString(cs, CENTER_X, 136);
     }
 }
 
-// ── Render: health page ───────────────────────────────
+// ── Render: health page (A6 tri-state) ────────────────
 void draw_health_page() {
     tft.fillScreen(C_BG);
     tft.setTextDatum(MC_DATUM);
@@ -452,18 +586,24 @@ void draw_health_page() {
     tft.setFont(&fonts::Font2);
     tft.drawString("HEALTH", CENTER_X, 26);
 
-    // Full-word component rows — single centered column, dots pulled well
-    // inside the round glass (old two-column layout clipped at the edge).
-    const int rows_y[4]   = {48, 70, 92, 114};
+    // Component rows — tri-state: OK (green) / DOWN (red) / UNKNOWN (grey)
+    const int rows_y[4]     = {48, 70, 92, 114};
     const char* rows_txt[4] = {"GATEWAY", "STORAGE", "DASHBOARD", "PLATFORMS"};
-    bool rows_ok[4] = {comp_gw_ok, comp_storage_ok, comp_dash_ok, comp_platforms_ok};
+    CompState rows_state[4] = {comp_gw, comp_storage, comp_dash, comp_platforms};
 
     tft.setFont(&fonts::Font2);
     for (int i = 0; i < 4; i++) {
         tft.setTextColor(C_TEXT, C_BG);
         tft.drawString(rows_txt[i], CENTER_X, rows_y[i]);
-        tft.fillCircle(CENTER_X - 56, rows_y[i], 3, rows_ok[i] ? C_OK : C_DOWN);
+        uint16_t dot_color;
+        switch (rows_state[i]) {
+            case COMP_OK:      dot_color = C_OK;      break;
+            case COMP_DOWN:    dot_color = C_DOWN;    break;
+            default:           dot_color = C_DIM;     break;  // UNKNOWN → grey
+        }
+        tft.fillCircle(CENTER_X - 56, rows_y[i], 3, dot_color);
     }
+
     // Dashboard error count (orange suffix, only when > 0)
     if (dash_errors > 0) {
         tft.setFont(&fonts::Font0);
@@ -471,14 +611,29 @@ void draw_health_page() {
         tft.drawString(String(dash_errors) + "E", CENTER_X + 55, 92);
     }
 
-    // Auth state (Nous session) + host CPU/RAM
+    // Auth state — tri-state (UNKNOWN / EXPIRED / OK)
     tft.setFont(&fonts::Font2);
-    tft.setTextColor(session_valid ? C_OK : C_DOWN, C_BG);
-    tft.drawString(session_valid ? "AUTH OK" : "AUTH EXPIRED", CENTER_X, 136);
+    const char* auth_txt;
+    uint16_t auth_color;
+    switch (g_session_state) {
+        case SESS_OK:      auth_txt = "AUTH OK";      auth_color = C_OK;   break;
+        case SESS_EXPIRED: auth_txt = "AUTH EXPIRED";  auth_color = C_DOWN; break;
+        default:           auth_txt = "AUTH ?";        auth_color = C_DIM;  break;
+    }
+    tft.setTextColor(auth_color, C_BG);
+    tft.drawString(auth_txt, CENTER_X, 136);
 
+    // Host CPU/RAM — A6: "--" when absent (not silently carried over)
     tft.setFont(&fonts::Font0);
     tft.setTextColor(C_DIM, C_BG);
-    tft.drawString("CPU " + String(host_cpu) + "%  RAM " + String(host_ram) + "%", CENTER_X, 148);
+    String host_str;
+    if (!g_host_known) {
+        host_str = "CPU --  RAM --";
+    } else {
+        host_str = "CPU " + String(host_cpu) + "%  RAM " + String(host_ram) + "%";
+        if (is_stale()) host_str += "?";
+    }
+    tft.drawString(host_str, CENTER_X, 150);
 }
 
 // ── Render: full screen (rotates 4 pages) ─────────────
@@ -487,7 +642,7 @@ void render() {
     switch (page) {
         case 0: { // STATUS
             tft.fillScreen(C_BG);
-            draw_platform_ring(platforms_up, platforms_total);
+            draw_platform_ring();
             draw_center(active_sessions);
             draw_state(gateway_busy, gateway_degraded);
             draw_disk_bar(disk_pct);
@@ -539,7 +694,9 @@ void setup() {
     // Initial fetch
     fetch_ok = fetch_dashboard();
     if (fetch_ok) {
-        Serial.printf("[dash] fetch OK: %d sessions, %d/%d platforms\n", active_sessions, platforms_up, platforms_total);
+        last_success = millis();  // A12: set AFTER success
+        Serial.printf("[dash] fetch OK: %d sessions, %d/%d platforms, schema=%d\n",
+                      active_sessions, g_platforms_rendered, g_platforms_total, g_schema);
         render();
     } else {
         Serial.println("[dash] initial fetch FAILED");
@@ -547,11 +704,29 @@ void setup() {
     }
 }
 
-// ── LOOP ──────────────────────────────────────────────
+// ── LOOP (A12: decoupled UI timing from fetch) ───────
 void loop() {
     unsigned long now = millis();
+
+    // A12: page rotation driven by millis() — independent of fetch
+    static int current_page = -1;
+    int new_page = (now / PAGE_MS) % PAGE_COUNT;
+    bool page_changed = (new_page != current_page);
+
+    // A12: attention blink state change triggers redraw
+    static bool blink_was_on = false;
+    bool blink_now_on = (now / 400) % 2 == 0;
+    bool blink_changed = (blink_now_on != blink_was_on);
+
+    if (page_changed || (blink_changed && fetch_ok)) {
+        current_page = new_page;
+        blink_was_on = blink_now_on;
+        if (fetch_ok) render();
+    }
+
+    // Fetch on its own schedule (10s)
     if (now - last_fetch >= FETCH_INTERVAL) {
-        last_fetch = now;
+        last_fetch = now;  // unsigned subtraction is rollover-safe
 
         if (WiFi.status() != WL_CONNECTED) {
             wifi_connect();
@@ -559,11 +734,39 @@ void loop() {
 
         fetch_ok = fetch_dashboard();
         if (fetch_ok) {
+            last_success = now;  // A12: stamp AFTER success, not before
             render();
         } else {
             show_error();
         }
     }
+
     led_update();
     delay(50);
+}
+
+// ── WiFi ──────────────────────────────────────────────
+void wifi_connect() {
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[dash] connecting to %s...\n", WIFI_SSID);
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_TEXT, C_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setFont(&fonts::Font2);
+    tft.drawString("Connecting", CENTER_X, CENTER_Y - 20);
+    tft.drawString("WiFi...", CENTER_X, CENTER_Y + 10);
+
+    int dots = 0;
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        dots++;
+        if (dots % 20 == 0) { // every 10s
+            Serial.printf("[dash] ...still connecting (%lus), status=%d\n", (millis() - t0) / 1000, WiFi.status());
+        }
+        tft.drawChar('.', CENTER_X - 12 + (dots % 3) * 12, CENTER_Y + 40);
+        if (millis() - t0 > 45000) break; // hidden SSID + slow router: cap at 45s
+    }
+    tft.fillScreen(C_BG);
+    Serial.printf("[dash] WiFi status=%d, IP %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
 }
