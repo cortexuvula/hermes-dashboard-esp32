@@ -76,7 +76,23 @@ public:
     setPanel(&_panel);
   }
 };
-LGFX tft;
+// ── Display + double buffer ───────────────────────────
+// The panel has no framebuffer, so every repaint showed its fillScreen() as a
+// blank-then-redraw flash. Drawing goes instead into a full-screen canvas that is
+// pushed in ONE SPI burst, which makes each repaint atomic and invisible — including
+// the 12s page turn and any data change.
+// `tft.` deliberately stays at every call site: it resolves to whichever target is
+// active, so tools/check_layout.py keeps scanning the draw sites it claims for. Renaming
+// the receiver would silently zero that scan (see the receiver-locked scanner note there).
+LGFX panel;                     // the panel device: init / rotation / brightness / push
+LGFX_Sprite canvas(&panel);     // offscreen canvas: 320x172x16bpp ≈ 110 KB of the ~327 KB
+lgfx::LovyanGFX* ui_target = &panel;
+#define tft (*ui_target)        // every draw call routes to the active target
+bool canvas_ok = false;         // false = allocation failed → direct drawing (fallback)
+
+// Push the finished frame to the panel. No-op in fallback mode, where the draws have
+// already gone straight to the panel.
+static inline void present() { if (canvas_ok) canvas.pushSprite(0, 0); }
 
 // ── Display constants ─────────────────────────────────
 // Landscape UI: panel rotated 90° → 320x172, circle center (160,86)
@@ -889,6 +905,7 @@ void render(int page) {
         case 2: draw_tokens_page(true);  break;  // TOKENS 7D
         case 3: draw_health_page();      break;  // HEALTH
     }
+    present();   // the whole page reaches the panel in one burst — no visible clear
 }
 
 // ── Error screen ──────────────────────────────────────
@@ -898,6 +915,7 @@ void show_error() {
     tft.setTextDatum(MC_DATUM);
     tft.setFont(&fonts::Font2);
     tft.drawString("OFFLINE", CENTER_X, CENTER_Y);
+    present();
 }
 
 // ── SETUP ─────────────────────────────────────────────
@@ -909,9 +927,21 @@ void setup() {
     led_init();
     set_led(0, 120, 0); // boot: dim green
 
-    tft.init();
-    tft.setRotation(1);   // LANDSCAPE: 320x172, 90° CW (USB port to the right; use 3 to flip)
-    tft.setBrightness(128); // 50% max per Waveshare warning
+    panel.init();          // the three device-only calls stay on the panel:
+    panel.setRotation(1);  // LANDSCAPE: 320x172, 90° CW (USB right; 3 to flip). The
+    panel.setBrightness(128); // draw target `tft` is a LovyanGFX base pointer, which has
+                              // the drawing API but not init/rotation/brightness.
+    // Allocate the canvas ONCE and EARLY: ~110 KB has to come out of a heap that WiFi and
+    // HTTP fragment later. On failure fall back to direct drawing — the board still works
+    // correctly, it just flickers again.
+    const int32_t CANVAS_W = panel.width(), CANVAS_H = panel.height();
+    canvas.setColorDepth(16);
+    canvas_ok = (canvas.createSprite(CANVAS_W, CANVAS_H) != nullptr);
+    if (canvas_ok) ui_target = &canvas;
+    Serial.printf("[dash] canvas: %ldx%ld 16bpp %s (free heap %u, max alloc %u)\n",
+                  (long)CANVAS_W, (long)CANVAS_H,
+                  canvas_ok ? "OK — double buffered" : "FAILED — direct drawing fallback",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     tft.fillScreen(C_BG);
     // Memory headroom — max alloc is the number that decides whether a full-screen
     // canvas sprite (320x172x16bpp ~= 110 KB) can be allocated for flicker-free redraws.
@@ -926,6 +956,7 @@ void setup() {
     tft.setTextColor(C_DIM, C_BG);
     tft.setFont(&fonts::Font2);
     tft.drawString("Dashboard", CENTER_X, CENTER_Y + 10);
+    present();                 // canvas → panel in one burst
     delay(1000);
 
     wifi_connect();
@@ -969,6 +1000,7 @@ void loop() {
         if (fetch_ok) render(current_page);
     } else if (blink_changed && fetch_ok && current_page == 0) {
         draw_platform_ring();
+        present();   // ring-only redraw is a single burst too — still no flash
     }
     blink_was_on = blink_now_on;
 
@@ -1021,6 +1053,7 @@ void wifi_connect() {
     tft.setFont(&fonts::Font2);
     tft.drawString("Connecting", CENTER_X, CENTER_Y - 20);
     tft.drawString("WiFi...", CENTER_X, CENTER_Y + 10);
+    present();
 
     int dots = 0;
     unsigned long t0 = millis();
@@ -1031,8 +1064,10 @@ void wifi_connect() {
             Serial.printf("[dash] ...still connecting (%lus), status=%d\n", (millis() - t0) / 1000, WiFi.status());
         }
         tft.drawChar('.', CENTER_X - 12 + (dots % 3) * 12, CENTER_Y + 40);
+        present();             // each progress dot must reach the panel
         if (millis() - t0 > 45000) break; // hidden SSID + slow router: cap at 45s
     }
     tft.fillScreen(C_BG);
+    present();
     Serial.printf("[dash] WiFi status=%d, IP %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
 }

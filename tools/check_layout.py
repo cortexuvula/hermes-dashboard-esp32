@@ -78,7 +78,18 @@ NON_RENDERING = {
 
 # Broad regex: any tft.* call that could place pixels on screen.
 # Matches: draw*, fill*, push*, print*, setPixel*
+# NOTE: 'tft' is the sketch's DRAW TARGET, which may be a real panel or an offscreen
+# canvas sprite (double buffering). It deliberately stays named `tft` at every call site
+# so this scan keeps working; see MIN_SCANNED_DRAWS for the guard that makes a rename fail
+# loudly instead of passing vacuously.
 DRAW_CALL_RE = re.compile(r"tft\.(draw|fill|push|print|setPixel)[A-Za-z0-9_]*\(")
+
+# Floor for the scan above. A renamed/aliased draw target would make DRAW_CALL_RE find
+# ZERO calls, and zero found means nothing is unclaimed — the completeness assertion would
+# pass on a completely unverified layout. Measured value at the double-buffering commit
+# (the scanner counts 40: fillScreen is excluded as non-rendering); raise it when elements
+# are added.
+MIN_SCANNED_DRAWS = 40
 
 
 class Sketch:
@@ -565,6 +576,15 @@ def main(argv):
         return 2
 
     # F3: COMPLETENESS ASSERTION — every draw call must be claimed (positional, 1:1)
+    # Guard the scan itself first: a receiver rename makes DRAW_CALL_RE find nothing, and
+    # nothing-found trivially satisfies "everything is claimed".
+    if len(sk.draws) < MIN_SCANNED_DRAWS:
+        print(f"SCAN BROKEN: only {len(sk.draws)} draw call(s) found, expected >= "
+              f"{MIN_SCANNED_DRAWS}. The scanner is receiver-locked to 'tft.' — if the draw "
+              f"target was renamed or aliased, update DRAW_CALL_RE and this floor together "
+              f"(otherwise this gate passes on an unverified layout).")
+        return 1
+
     unclaimed = []
     for line_no, font, text in sk.draws:
         if line_no not in claimed:
