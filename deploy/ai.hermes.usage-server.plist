@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>ai.hermes.usage-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/cortexuvula/Development/hermes-dashboard-esp32/relay/usage-server.py</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
+    <key>StandardOutPath</key><string>/Users/cortexuvula/.hermes/logs/usage-server.log</string>
+    <key>StandardErrorPath</key><string>/Users/cortexuvula/.hermes/logs/usage-server-error.log</string>
+</dict>
+</plist>

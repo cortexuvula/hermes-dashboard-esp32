@@ -1,0 +1,9 @@
+// WORK unit — ESP32 on the same LAN as the machine running the Hermes
+// dashboard, hitting it directly (or through a local relay) with no Tailscale
+// hop in the path.
+//
+// Copy this file to wifi_config.work.h and fill in real values.
+// wifi_config.work.h is gitignored — never commit real credentials.
+#define WIFI_SSID "YOUR_OFFICE_SSID"
+#define WIFI_PASS "YOUR_OFFICE_WIFI_PASSWORD"
+#define DASHBOARD_URL "http://192.168.4.37:9120/api/status"

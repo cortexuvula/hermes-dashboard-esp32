@@ -1,0 +1,9 @@
+// HOME unit — ESP32 on the same LAN as the relay host (e.g. an always-on
+// Linux box), talking to relay.py at <relay-host-ip>:9120, which proxies the
+// Hermes dashboard over Tailscale.
+//
+// Copy this file to wifi_config.home.h and fill in real values.
+// wifi_config.home.h is gitignored — never commit real credentials.
+#define WIFI_SSID "YOUR_HOME_SSID"
+#define WIFI_PASS "YOUR_HOME_WIFI_PASSWORD"
+#define DASHBOARD_URL "http://192.168.1.171:9120/api/status"

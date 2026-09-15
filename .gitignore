@@ -1,0 +1,23 @@
+# ─ Per-unit credentials — NEVER commit (contains WiFi PSKs) ──
+hermes-dash-esp32/wifi_config.home.h
+hermes-dash-esp32/wifi_config.work.h
+
+# ── Build output (compiled images embed the WiFi PSK in plaintext) ──
+hermes-dash-esp32/build/
+hermes-dash-esp32/build-home/
+hermes-dash-esp32/build-work/
+*.bin
+*.elf
+*.map
+*.merged.bin
+sdkconfig
+sdkconfig.old
+build.options.json
+flash_args
+
+# ── Local / OS noise ──
+.DS_Store
+__pycache__/
+*.pyc
+*.bak
+*.bak-*

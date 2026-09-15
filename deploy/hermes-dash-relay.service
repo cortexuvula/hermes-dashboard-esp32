@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes Dashboard Relay (ESP32)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/cortexuvula/hermes-dashboard-relay/relay.py --listen-port 9120 --upstream http://100.79.10.43:9119/api/status
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
