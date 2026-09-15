@@ -24,7 +24,10 @@ single board this is accepted; it is not a general DoS defence.
 Contract (schema 2) — see the CONTRACT section in ../README.md:
   - Only the keys the board parses are emitted; nothing passes through.
   - Unavailable usage data is JSON null, never omitted, never zeroed
-    (tokens_24h / tokens_7d / host).
+    (tokens_24h / tokens_7d / host). Period and host objects are
+    ALL-OR-NOTHING (S3): if any required field is absent, null, or not
+    a real number (strings/booleans rejected), the whole object is
+    null — a partial object would render on the board as measured 0.
   - usage_age_s  int|null  age of the usage DATA: seconds since the
     producer's generated_at, clamped >= 0. Arbitrarily OLD timestamps
     are accepted and reported truthfully (a large age is real
@@ -209,10 +212,24 @@ def _fetch_capped(url: str, timeout: float, cap: int) -> bytes:
 
 
 def _pick(obj, fields):
-    """Allowlist a flat dict; missing/unavailable → None, never zeroed."""
+    """All-or-nothing allowlist of a flat dict (S3).
+
+    If ANY required field is absent, JSON null, or not a real number
+    (booleans and strings rejected — the board would render them as a
+    measured 0 because per-field defaults apply once the object is
+    present), the WHOLE object is emitted as None: a period/host object
+    is either complete and numeric, or null. The board renders null as
+    "--" (unknown), which is the correct rendering for partial data.
+    """
     if not isinstance(obj, dict):
         return None
-    return {f: obj.get(f) for f in fields}
+    picked = {}
+    for f in fields:
+        v = obj.get(f)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None  # absent, null, or mistyped → all-or-nothing null
+        picked[f] = v
+    return picked
 
 
 class UsageRefresher(threading.Thread):

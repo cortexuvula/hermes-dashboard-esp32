@@ -576,5 +576,91 @@ class TestConcurrency(RelayTestCase):
             httpd.server_close()
 
 
+class TestAllOrNothing(RelayTestCase):
+    """S3: period/host objects are complete-and-numeric or null — never
+    partial (a null INSIDE a present object renders as measured 0 on the
+    board, because per-field defaults apply once the object is present)."""
+
+    def _get_with_usage(self, usage):
+        self.handler.usage_body = json.dumps(usage).encode()
+        self.cfg.refresher.interval = 0.05
+        deadline = time.monotonic() + 5
+        data = None
+        while time.monotonic() < deadline:
+            _, data = self.get()
+            if data["generated_at"] == usage.get("generated_at"):
+                break
+            time.sleep(0.05)
+        return data
+
+    def test_period_one_field_null_nulls_whole_object(self):
+        u = dict(SAMPLE_USAGE)
+        u["generated_at"] = int(time.time()) - 2
+        u["h24"] = dict(u.get("h24") or {})
+        u["h24"]["total"] = None
+        data = self._get_with_usage(u)
+        self.assertIsNone(data["tokens_24h"],
+                          "one null field must null the whole period object")
+        self.assertIsNotNone(data["tokens_7d"],
+                             "the untouched period stays intact")
+
+    def test_period_mistyped_field_nulls_whole_object(self):
+        for bad in ("0.42", True):   # string where a number belongs; bool
+            u = dict(SAMPLE_USAGE)
+            u["generated_at"] = int(time.time()) - 2
+            u["h24"] = dict(u.get("h24") or {})
+            u["h24"]["est_cost"] = bad
+            data = self._get_with_usage(u)
+            self.assertIsNone(data["tokens_24h"],
+                               f"mistyped field {bad!r} must null the object")
+            u["h24"]["est_cost"] = 0.42
+            u["h24"].pop("cache", None)   # missing field, same rule
+            data = self._get_with_usage(u)
+            self.assertIsNone(data["tokens_24h"],
+                              "a missing field must null the object")
+
+    def test_period_complete_numeric_emitted_intact(self):
+        u = dict(SAMPLE_USAGE)
+        u["generated_at"] = int(time.time()) - 2
+        complete = {"total": 36, "input": 10, "output": 20, "cache": 5,
+                    "reasoning": 1, "api_calls": 3, "sessions": 2,
+                    "est_cost": 0.42}
+        u["h24"] = complete
+        data = self._get_with_usage(u)
+        self.assertEqual(data["tokens_24h"], complete)
+        self.assertEqual(set(data["tokens_24h"]), set(relay.TOKEN_FIELDS))
+
+    def test_host_one_field_null_nulls_whole_object(self):
+        u = dict(SAMPLE_USAGE)
+        u["generated_at"] = int(time.time()) - 2
+        u["host"] = {"cpu_percent": None, "load_percent": 34,
+                     "ram_used_percent": 61, "ram_total_mb": 32768}
+        data = self._get_with_usage(u)
+        self.assertIsNone(data["host"],
+                          "one null field must null the whole host object")
+
+    def test_host_mistyped_field_nulls_whole_object(self):
+        for field, bad in (("ram_total_mb", "32768"),
+                           ("load_percent", False)):
+            u = dict(SAMPLE_USAGE)
+            u["generated_at"] = int(time.time()) - 2
+            u["host"] = {"cpu_percent": 12, "load_percent": 34,
+                         "ram_used_percent": 61, "ram_total_mb": 32768}
+            u["host"][field] = bad
+            data = self._get_with_usage(u)
+            self.assertIsNone(data["host"],
+                               f"mistyped {field}={bad!r} must null host")
+
+    def test_host_complete_numeric_emitted_intact(self):
+        u = dict(SAMPLE_USAGE)
+        u["generated_at"] = int(time.time()) - 2
+        complete = {"cpu_percent": 12, "load_percent": 34,
+                    "ram_used_percent": 61, "ram_total_mb": 32768}
+        u["host"] = complete
+        data = self._get_with_usage(u)
+        self.assertEqual(data["host"], complete)
+        self.assertEqual(set(data["host"]), set(relay.HOST_FIELDS))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
