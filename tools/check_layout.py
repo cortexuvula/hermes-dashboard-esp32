@@ -397,6 +397,91 @@ def check(sk, prefix=False):
     return res, cx, cy, limit, claimed
 
 
+# Visual glyph bands (NOT the em box). The aperture check above deliberately uses the
+# full em height (conservative, keeps glyph corners inside the circle); a collision
+# check must use the height the glyphs actually occupy, or every adjacent line looks
+# like an overlap. Values are the drawn cap/ascender band for each family; Font2 is an
+# 8x16 cell whose glyphs occupy ~12 px, DejaVu40 digits ~28 px.
+GLYPH_H = {"Font0": 7, "Font2": 12, "DejaVu24": 18, "DejaVu40": 28}
+
+
+def overlap_boxes(sk, cx, cy):
+    """Every drawn element as a visual box, per page, from the parsed constants."""
+    out = []  # (page, name, x0, x1, y0, y1)
+
+    def txt(page, name, x, y, s, font):
+        w = text_w(s, font)
+        h = GLYPH_H.get(font, FONTS[font][1])
+        out.append((page, name, x - w / 2.0, x + w / 2.0, y - h / 2.0, y + h / 2.0))
+
+    def rect(page, name, x, y, w, h):
+        out.append((page, name, x, x + w, y, y + h))
+
+    def circ(page, name, bx, by, r):
+        out.append((page, name, bx - r, bx + r, by - r, by + r))
+
+    # ── STATUS ─────────────────────────────────────────────────────────────
+    ring_r, dot_r = sk.val("STATUS_RING_R"), sk.val("STATUS_RING_DOT_R")
+    for i in range(8):
+        ang = math.radians(150 + i * (30 - 150) / 7)
+        circ("STATUS", f"ring dot {i}", cx + int(ring_r * math.cos(ang)),
+             cy - int(ring_r * math.sin(ang)), dot_r)
+    txt("STATUS", "overflow +99", cx + sk.val("STATUS_OVERFLOW_DX"),
+        cy - sk.val("STATUS_OVERFLOW_DY"), WORST["OVERFLOW"], "Font0")
+    txt("STATUS", "number", cx, sk.val("STATUS_NUM_Y"), "999", "DejaVu40")
+    txt("STATUS", "SESSIONS", cx, sk.val("STATUS_SESS_Y"), WORST["SESSIONS"], "Font2")
+    txt("STATUS", "state", cx, sk.val("STATUS_STATE_Y"), WORST["STATE"], "Font2")
+    bar_y = cy + sk.val("STATUS_DISK_BAR_DY")
+    bar_w, bar_h = sk.val("STATUS_DISK_BAR_W"), sk.val("STATUS_DISK_BAR_H")
+    rect("STATUS", "disk bar", cx - bar_w / 2.0, bar_y, bar_w, bar_h)
+    txt("STATUS", "disk label", cx, bar_y + sk.val("STATUS_DISK_LBL_DY"), WORST["DISK"], "Font0")
+    foot_y = cy + sk.val("STATUS_FOOTER_DY")
+    txt("STATUS", "footer", cx, foot_y, WORST["FOOTER"], "Font0")
+    circ("STATUS", "update dot", cx + sk.val("STATUS_DOT_DX"), foot_y, sk.val("STATUS_DOT_R"))
+
+    # ── TOKEN 24H and 7D (the two pages share the y positions but not the fonts) ──
+    for page, det1 in (("TOKEN 24H", ("io", WORST["TK_IO"], "Font0")),
+                       ("TOKEN 7D", ("cost", WORST["TK_COST"], "Font2"))):
+        txt(page, "heading", cx, sk.val("TK_HEAD_Y"), WORST["TK_HEAD"], "Font0")
+        txt(page, "qualifier", cx, sk.val("TK_QUAL_Y"), WORST["TK_QUAL"], "Font0")
+        txt(page, "big total", cx, sk.val("TK_BIG_Y"), WORST["TK_BIG"], "DejaVu40")
+        txt(page, f"det1 {det1[0]}", cx, sk.val("TK_DET1_Y"), det1[1], det1[2])
+        txt(page, "det2", cx, sk.val("TK_DET2_Y"),
+            WORST["TK_CACHE"] if page == "TOKEN 24H" else WORST["TK_CALLS"],
+            "Font0")
+        txt(page, "det3", cx, sk.val("TK_DET3_Y"),
+            WORST["TK_CALLS"] if page == "TOKEN 24H" else WORST["TK_IO"], "Font0")
+
+    # ── HEALTH ─────────────────────────────────────────────────────────────
+    txt("HEALTH", "heading", cx, sk.val("HL_HEAD_Y"), WORST["HL_HEAD"], "Font2")
+    rows = [sk.val(n) for n in ("HL_ROW0_Y", "HL_ROW1_Y", "HL_ROW2_Y", "HL_ROW3_Y")]
+    for i, y in enumerate(rows):
+        txt("HEALTH", f"row {i}", cx, y, WORST["HL_ROW"], "Font2")
+        circ("HEALTH", f"row {i} dot", cx - sk.val("HL_DOT_DX"), y, sk.val("HL_DOT_R"))
+    txt("HEALTH", "error 9E", cx + sk.val("HL_ERR_DX"), sk.val("HL_ERR_Y"), WORST["HL_ERR"], "Font0")
+    txt("HEALTH", "auth", cx, sk.val("HL_AUTH_Y"), WORST["HL_AUTH"], "Font2")
+    txt("HEALTH", "host", cx, sk.val("HL_HOST_Y"), WORST["HL_HOST"], "Font0")
+
+    return out
+
+
+def check_overlaps(sk, cx, cy, min_px=1.0):
+    """Pairwise collision check per page. Returns (box_count, [(page, a, b, ox, oy)])."""
+    boxes = overlap_boxes(sk, cx, cy)
+    bad = []
+    for i in range(len(boxes)):
+        pi, ni, ax0, ax1, ay0, ay1 = boxes[i]
+        for j in range(i + 1, len(boxes)):
+            pj, nj, bx0, bx1, by0, by1 = boxes[j]
+            if pi != pj:
+                continue
+            ox = min(ax1, bx1) - max(ax0, bx0)
+            oy = min(ay1, by1) - max(ay0, by0)
+            if ox > min_px and oy > min_px:
+                bad.append((pi, ni, nj, ox, oy))
+    return len(boxes), bad
+
+
 def main(argv):
     prefix = "--prefix" in argv
     sketch = DEFAULT_SKETCH
@@ -445,7 +530,20 @@ def main(argv):
         for name, r, _, _ in bad:
             print(f"  - {name}: r={r:.1f}")
         return 1
-    print(f"PASSED: all {len(res)} elements within R={limit}, all {len(sk.draws)} draw calls claimed")
+
+    # OVERLAP CHECK — the aperture gate above cannot see two elements colliding.
+    # Drawn on real hardware this is what "text overlapping" looks like.
+    n_boxes, overlaps = check_overlaps(sk, cx, cy)
+    if overlaps:
+        print()
+        print(f"OVERLAP FAILURE: {len(overlaps)} element pair(s) collide on screen "
+              f"({n_boxes} boxes checked):")
+        for page, a, b, ox, oy in overlaps:
+            print(f"  [{page}] {a} <-> {b}   overlap {ox:.1f}x{oy:.1f} px")
+        return 1
+
+    print(f"PASSED: all {len(res)} elements within R={limit}, all {len(sk.draws)} draw calls claimed, "
+          f"{n_boxes} boxes with no collisions")
     return 0
 
 

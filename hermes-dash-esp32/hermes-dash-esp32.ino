@@ -99,8 +99,8 @@ LGFX tft;
 #define STATUS_OVERFLOW_DY    25     // CENTER_Y - this = overflow y
 #define STATUS_NUM_Y          72
 #define STATUS_NUM_W          48     // DejaVu40 2-digit
-#define STATUS_SESS_Y         100
-#define STATUS_STATE_Y        118
+#define STATUS_SESS_Y         94     // was 100 — glyph band collided with the state line
+#define STATUS_STATE_Y        110    // was 118 — its band overlapped the disk bar (120..126)
 #define STATUS_DISK_BAR_W     112
 #define STATUS_DISK_BAR_H     6
 #define STATUS_DISK_BAR_DY    34     // CENTER_Y + this
@@ -128,7 +128,7 @@ LGFX tft;
 #define HL_DOT_R              3
 #define HL_ERR_DX             55     // CENTER_X + this
 #define HL_ERR_Y              92
-#define HL_AUTH_Y             134    // was 136 (moved up for host line)
+#define HL_AUTH_Y             128    // was 134 — glyph band overlapped the host line (136..144)
 #define HL_HOST_Y             140    // was 150 — exceeded R=80 (moved up)
 
 // ── Colors (RGB565) ───────────────────────────────────
