@@ -1,9 +1,19 @@
+# OPERATOR-SPECIFIC EXAMPLE — copy to ~/.config/systemd/user/ and edit.
+# The hostnames/paths below are from our own deployment; yours will differ.
+# The relay must be reachable by the board over the LAN:
+#   - default bind is 0.0.0.0 (board polls it); restrict with --bind if
+#     it only serves localhost
+#   - allow inbound TCP 9120 in the firewall, e.g. on ufw:
+#       sudo ufw allow from 192.168.1.0/24 to any port 9120 proto tcp \
+#         comment 'hermes dashboard relay (ESP32)'
 [Unit]
 Description=Hermes Dashboard Relay (ESP32)
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/cortexuvula/hermes-dashboard-relay/relay.py --listen-port 9120 --upstream http://100.79.10.43:9119/api/status
+# --usage is required for the tokens/host pages; without it those fields
+# are served as JSON null (schema 2) rather than omitted.
+ExecStart=/usr/bin/python3 /home/cortexuvula/hermes-dashboard-relay/relay.py --listen-port 9120 --upstream http://100.79.10.43:9119/api/status --usage http://100.79.10.43:9121/
 Restart=always
 RestartSec=30
 
