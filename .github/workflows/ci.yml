@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Relay unit tests (stdlib unittest)
+        run: python3 -m unittest discover -s tests -v
+
+  shell-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build-wrapper tests (bash, stubbed toolchain)
+        run: bash tests/test_build_wrapper.sh
+
+  firmware-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile-only firmware gate (never publishes binaries)
+        run: |
+          if [[ -x tools/ci-compile.sh ]]; then
+            tools/ci-compile.sh
+          else
+            # Equivalent inline (firmware lane may land tools/ci-compile.sh)
+            curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+            export PATH="$PWD/bin:$PATH"
+            arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+            arduino-cli core install esp32:esp32 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+            cd hermes-dash-esp32
+            cp wifi_config.work.h.example wifi_config.work.h   # dummy values only
+            arduino-cli lib install LovyanGFX ArduinoJson FastLED
+            arduino-cli compile \
+              --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app \
+              --output-dir /tmp/dash-build .
+          fi
