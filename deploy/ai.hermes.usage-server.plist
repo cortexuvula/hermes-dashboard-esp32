@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- OPERATOR-SPECIFIC EXAMPLE — copy to ~/Library/LaunchAgents/ and edit. -->
+<!-- The service binds 127.0.0.1 by default. The relay on ANOTHER host must -->
+<!-- reach it, so our deployment passes --bind 0.0.0.0 deliberately and the -->
+<!-- Mac firewall allows inbound TCP 9121 from the relay host (Tailscale).  -->
+<!-- If the relay runs on THIS machine, keep the default 127.0.0.1 bind.    -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -7,6 +12,10 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>/Users/cortexuvula/Development/hermes-dashboard-esp32/relay/usage-server.py</string>
+        <string>--bind</string>
+        <string>0.0.0.0</string>
+        <string>--db</string>
+        <string>/Users/cortexuvula/.hermes/state.db</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key>

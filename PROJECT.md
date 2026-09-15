@@ -4,7 +4,7 @@ ESP32-C6 desk widget that shows live Hermes gateway stats from `http://<host>:91
 
 **Public repo**: https://github.com/cortexuvula/hermes-dashboard-esp32 (branch `main`). Committed:
 `PROJECT.md`, `README.md`, `build-flash.sh`, the sketch, `wifi_config.h` (selector), the `.example`
-unit configs, `relay/`, `deploy/`. **Gitignored** (never publish): `wifi_config.work.h`,
+unit configs, `relay/`, `deploy/`, `tests/`, `.github/workflows/ci.yml`. **Gitignored** (never publish): `wifi_config.work.h`,
 `wifi_config.home.h`, `build*/` — a compiled `merged.bin`/`.elf` embeds the WiFi PSK in plaintext.
 Local git note: after the Xcode 27 update, `/usr/bin/git` was blocked by an unaccepted Xcode license;
 run `sudo xcodebuild -license accept` (done 2026-09-15 — both git and Homebrew work again).
@@ -42,19 +42,19 @@ hermes-dashboard-esp32/
     └── relay.py                ← Tailscale relay (runs on omarchy-home)
 ```
 
-## Tomorrow — when the board arrives
+## Tomorrow — when the board arrives  *(historical — the board arrived; kept for the bring-up notes)*
 
 ### 1. Identify the board
 Plug in USB-C, check `ls /dev/cu.*` — it should appear as `/dev/cu.usbmodem*` or similar.
 Run `esptool chip_id` to confirm it's an ESP32-C6.
 
-### 2. Install Arduino libraries
+### 2. Install Arduino libraries  *(historical — the build now uses LovyanGFX + FastLED, not TFT_eSPI/SmartLed; see README)*
 ```bash
 arduino-cli lib install "TFT_eSPI"
 arduino-cli lib install "ArduinoJson"
 ```
 
-### 3. Configure for deployment
+### 3. Configure for deployment  *(historical — TFT_eSPI/User_Setup.h approach predates the LovyanGFX switch; see README)*
 Edit `firmware/wifi_config.h`:
 - WiFi SSID + password for the target network
 - Dashboard URL:
@@ -87,6 +87,22 @@ python3 relay/relay.py --upstream http://100.X.X.X:9119/api/status --listen-port
 # (optional) as a systemd service for persistence
 ```
 
+## Services audit (2026-09-15) — relay + usage-server rework
+
+Fixed per an independent audit (IDs referenced in commit messages):
+
+- **Wrapper (A1/A2)**: `build-flash.sh` resolves the project relative to itself, parses arguments strictly, and **never flashes unless `--flash` is passed**. See README for the new CLI.
+- **Exposure (A3)**: relay emits an allowlisted schema-2 object (CONTRACT table in README) — nothing upstream passes through. CORS is opt-in (`--cors`). usage-server binds **127.0.0.1 by default** — our cross-host deployment passes `--bind 0.0.0.0` deliberately (launchd plist in `deploy/` does); relay stays LAN-reachable by default (`--bind` to override; firewall rule documented in README).
+- **Limits (A4)**: both services have per-connection socket timeouts, bounded concurrency (semaphore; over-limit requests get logged 503s, never queue), and usage-server serves a cached payload refreshed at most every 10 s so request rate cannot drive collection.
+- **Timing (A5)**: every upstream fetch (status and usage) runs on a worker thread abandoned at a hard TOTAL budget (3.0 s status) — connect + status line + headers + body are ALL bounded (R1 closed the header gap); at the deadline the fetch socket is force-closed so the abandoned worker exits and its FD is released promptly (S2). Body reads additionally self-abort on an in-loop monotonic deadline. A trickle of bytes or header lines that completes each recv inside the socket timeout is still cut off (worst case observed ~3.0 s + response write). Usage is refreshed on a background thread (a stalled usage upstream costs ~1–5 ms). Status failure → 502 + generic JSON error (board renders OFFLINE); upstream detail is relay-log-only.
+- **Null semantics (A6/S3/S4a)**: unavailable usage data is JSON null (never omitted, never zeroed); `usage_age_s` = **DATA age** — seconds since the producer's `generated_at`, clamped ≥ 0, and truthful for arbitrarily old data (only non-positive or >24 h-future timestamps are treated as unknown, falling back to fetch time) because usage-server serves its last-good payload indefinitely and the board has no other staleness signal; `generated_at`, `schema: 2`; `components` null (never fabricated) when upstream omits it. **All-or-nothing over the REQUIRED set**: periods require `total/input/output/cache/est_cost/api_calls/sessions`, host requires `cpu_percent/ram_used_percent` (exactly the fields the firmware renders) — any required field absent, null, mistyped, or non-finite (NaN/Infinity) ⇒ the whole object is null, never partial or zero-filled (the board renders a null inside a present object as a measured 0). `reasoning`, `load_percent`, `ram_total_mb` are pass-through: present-and-numeric or null, never veto — an unused field may not black out a used one. If a future firmware reads a pass-through field it joins the required set and the schema bumps. Null renders as "--" (unknown); a complete object renders values (dimmed/"?" when `usage_age_s` says stale).
+- **Cohorts (A8)**: `window_basis: "session_started_at"` in the usage payload; SQL unchanged (deliberately matches dashboard analytics). 24H/7D are session-start cohorts, not rolling windows — documented in README + on-display qualifier (firmware lane).
+- **Read caps (A9)**: hard byte caps — status 128 KB, usage 32 KB — enforced even when length is unknown/chunked.
+- **CPU (A13)**: `load_percent` = 1-min loadavg ÷ cores (queueing); `cpu_percent` = real sampled utilisation (macOS `top -l 2`, Linux `/proc/stat`), null when unobtainable — never a fake 0.
+- **Tests/CI (Imp 2)**: `tests/test_relay.py` (16 tests, stdlib unittest, synthetic upstreams) + `tests/test_build_wrapper.sh` (14 assertions, stubbed arduino-cli/scp/ssh) + `.github/workflows/ci.yml` (python + shell + compile-only firmware gate; `tools/ci-compile.sh` if the firmware lane lands it, inline equivalent otherwise; dummy wifi config only).
+
+**Deploy note for the Mac relay pair**: after pulling this rework to the live machines, the usage-server plist needs the new `--bind 0.0.0.0` (the relay on omarchy-home fetches it over Tailscale) and `hermes-dash-relay.service` needs `--usage …:9121/`. `deploy/` files are operator-specific examples.
+
 ## Deploy status (2026-09-15) — HOME UNIT re-flashed with the landscape build
 
 **Board**: Waveshare ESP32-C6-LCD-1.47 on omarchy-home `/dev/ttyACM0`, WiFi `onCortex`, DHCP **192.168.1.174**.
@@ -94,9 +110,10 @@ python3 relay/relay.py --upstream http://100.X.X.X:9119/api/status --listen-port
 4-page firmware (STATUS / TOKENS 24H / TOKENS 7D / HEALTH) + FastLED RGB + `huge_app`.
 **Config split (no more clobbering)**: `wifi_config.h` is now only a selector and includes
 `wifi_config.work.h` (default) or `wifi_config.home.h` (`-DUNIT_HOME`). The work build and the home build
-target different output dirs (`build-work/`, `build-home/`). Use **`./build-flash.sh {home|work} [--build-only]`** —
+target different output dirs (`build-work/`, `build-home/`). Use **`./build-flash.sh {home|work} [--build-only|--flash]`** —
 it compiles with the right flag, greps the image for the expected SSID/IP, then flashes (home: scp +
-esptool over ssh; work: arduino-cli upload to `/dev/cu.usbmodem*`).
+esptool over ssh; work: arduino-cli upload to `/dev/cu.usbmodem*`). *(CLI updated 2026-09-15: `--build-only` is now the
+default behaviour and flashing requires explicit `--flash`.)*
 **Home WiFi PSK**: NOT in BWS (`WIFI_PASSWORD` there = the office `cortexWork` PSK). The `onCortex` PSK was
 pulled from omarchy-home's NetworkManager profile (`sudo cat /etc/NetworkManager/system-connections/onCortex.nmconnection`)
 and lives only in `wifi_config.home.h` (chmod 600).
